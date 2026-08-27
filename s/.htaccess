@@ -1,0 +1,24 @@
+# Uploads directory: static files only, never execute scripts.
+
+Options -Indexes
+
+# Block common server-side script extensions even if misconfigured upstream.
+<FilesMatch "(?i)\.(php|phtml|php3|php4|php5|php7|php8|phar|cgi|pl|py|jsp|asp|aspx|shtml)$">
+    Require all denied
+</FilesMatch>
+
+# If mod_php is present, turn the engine off for this tree.
+<IfModule mod_php.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php7.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php8.c>
+    php_flag engine off
+</IfModule>
+
+# Prefer correct types; never let browsers MIME-sniff uploads.
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+</IfModule>

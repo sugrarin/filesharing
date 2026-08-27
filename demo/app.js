@@ -1,36 +1,79 @@
 let files = [];
-let categories = ['All files'];
+// [{ name, parent }] — parent is null for top-level categories.
+let categories = [{ name: 'All files', parent: null }];
 let currentCategory = 'All files';
 let searchQuery = '';
 let sortBy = 'date';
 let currentCategoryForEdit = null;
 let lastCopiedFileId = null;
+let currentFileForMenu = null;
+let sharedCategories = new Set();
+const csrfTokens = window.DISK_CSRF_TOKENS || {};
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const UPLOAD_CONCURRENCY = 3;
+/** Delay before delete is committed; matches undo-timer-bar animation. */
+const UNDO_DELAY_MS = 4000;
+const ALLOWED_UPLOAD_EXTENSIONS = new Set([
+    'pdf', 'doc', 'docx', 'odp', 'pptm', 'jpg', 'jpeg', 'png', 'zip', 'mp4', 'mov'
+]);
+let searchDebounceTimer = null;
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const uploadBtn = document.getElementById('uploadBtn');
 const searchInput = document.getElementById('searchInput');
 const clearSearch = document.getElementById('clearSearch');
-const sortToggle = document.getElementById('sortToggle');
+const sortByDate = document.getElementById('sortByDate');
+const sortBySize = document.getElementById('sortBySize');
 const filesContainer = document.getElementById('filesContainer');
+/** Currently highlighted file row (actions visible). JS-driven to avoid Safari sticky :hover. */
+let activeFileItem = null;
 const categoriesList = document.getElementById('categoriesList');
 const addCategoryBtn = document.getElementById('addCategoryBtn');
 const categoryModal = document.getElementById('categoryModal');
 const modalTitle = document.getElementById('modalTitle');
 const categoryNameInput = document.getElementById('categoryNameInput');
+const categoryParentField = document.getElementById('categoryParentField');
+const categoryParentSelect = document.getElementById('categoryParentSelect');
 const closeModal = document.getElementById('closeModal');
 const cancelModal = document.getElementById('cancelModal');
 const saveCategory = document.getElementById('saveCategory');
 const categoryMenu = document.getElementById('categoryMenu');
+const addSubcategoryBtn = document.getElementById('addSubcategoryBtn');
+const copyCategoryLinkBtn = document.getElementById('copyCategoryLinkBtn');
+const revokeCategoryShareBtn = document.getElementById('revokeCategoryShareBtn');
 const renameCategoryBtn = document.getElementById('renameCategoryBtn');
 const deleteCategoryBtn = document.getElementById('deleteCategoryBtn');
 const toastContainer = document.getElementById('toastContainer');
+const fileMenu = document.getElementById('fileMenu');
+const fileCopyBtn = document.getElementById('fileCopyBtn');
+const fileOpenBtn = document.getElementById('fileOpenBtn');
+const fileRenameBtn = document.getElementById('fileRenameBtn');
+const fileReplaceBtn = document.getElementById('fileReplaceBtn');
+const fileDeleteBtn = document.getElementById('fileDeleteBtn');
+
+function csrfToken(action) {
+    return csrfTokens[action] || '';
+}
+
+function jsonHeaders(action) {
+    return {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken(action)
+    };
+}
+
+function addCsrfToken(formData, action) {
+    formData.append('csrf_token', csrfToken(action));
+    return formData;
+}
 
 async function init() {
     await loadData();
     renderCategories();
     renderFiles();
     updateStats();
+    updateSortTabs();
     setupEventListeners();
 }
 
@@ -51,7 +94,10 @@ function setupEventListeners() {
     searchInput.addEventListener('input', handleSearch);
     clearSearch.addEventListener('click', handleClearSearch);
 
-    sortToggle.addEventListener('click', handleSortToggle);
+    sortByDate.addEventListener('click', () => setSortBy('date'));
+    sortBySize.addEventListener('click', () => setSortBy('size'));
+
+    setupFileRowHover();
 
     addCategoryBtn.addEventListener('click', () => openCategoryModal());
     closeModal.addEventListener('click', closeCategoryModal);
@@ -75,10 +121,32 @@ function setupEventListeners() {
 
     renameCategoryBtn.addEventListener('click', handleRenameCategory);
     deleteCategoryBtn.addEventListener('click', handleDeleteCategory);
+    addSubcategoryBtn.addEventListener('click', handleAddSubcategory);
+    copyCategoryLinkBtn.addEventListener('click', handleCategoryCopyLink);
+    revokeCategoryShareBtn.addEventListener('click', handleRevokeCategoryShare);
+
+    categoriesList.addEventListener('mouseover', (e) => {
+        const item = e.target.closest('.category-item[data-tooltip]');
+        if (item) showSidebarTooltip(item);
+    });
+    categoriesList.addEventListener('mouseout', (e) => {
+        const item = e.target.closest('.category-item[data-tooltip]');
+        if (item && !item.contains(e.relatedTarget)) hideSidebarTooltip();
+    });
+    categoriesList.addEventListener('scroll', hideSidebarTooltip);
+
+    fileCopyBtn.addEventListener('click', handleFileCopy);
+    fileOpenBtn.addEventListener('click', handleFileOpen);
+    fileRenameBtn.addEventListener('click', handleFileRenameMenu);
+    fileReplaceBtn.addEventListener('click', handleFileReplaceMenu);
+    fileDeleteBtn.addEventListener('click', handleFileDeleteMenu);
 
     document.addEventListener('click', (e) => {
         if (!categoryMenu.contains(e.target) && !e.target.classList.contains('category-menu-btn')) {
             categoryMenu.style.display = 'none';
+        }
+        if (!fileMenu.contains(e.target) && !e.target.classList.contains('file-menu-btn')) {
+            fileMenu.style.display = 'none';
         }
     });
 
@@ -115,113 +183,435 @@ function setupEventListeners() {
                 closeFileRenameModal();
             }
         }
+        trapFocusInOpenModal(e);
     });
 }
 
-async function loadData() {
-    // Client-side initialization
+function getOpenModal() {
+    if (categoryModal.style.display === 'flex') return categoryModal;
+    const fileRenameModal = document.getElementById('fileRenameModal');
+    if (fileRenameModal && fileRenameModal.style.display === 'flex') return fileRenameModal;
+    return null;
+}
 
-    // DEMO DATA: Put your static files in the project folder and list them here
-    files = [
-        {
-            id: 'demo-1',
-            name: 'Demo Screenshot.png',
-            size: 82188,
-            type: 'image/png',
-            url: 'demo-screenshot.png',
-            uploadDate: new Date().toISOString(),
-            category: 'Images',
-            extension: 'png'
-        },
-        {
-            id: 'demo-2',
-            name: 'The Productivity Project Summary.pdf',
-            size: 2306867,
-            type: 'application/pdf',
-            url: 'The-Productivity-Project-Summary.pdf',
-            uploadDate: new Date().toISOString(),
-            category: 'Documents',
-            extension: 'pdf'
-        },
-        {
-            id: 'demo-3',
-            name: 'iPhone User Guide.pdf',
-            size: 3880531,
-            type: 'application/pdf',
-            url: 'iPhone-User-Guide.pdf',
-            uploadDate: new Date().toISOString(),
-            category: 'Documents',
-            extension: 'pdf'
+function setActiveFileItem(item) {
+    if (activeFileItem === item) return;
+
+    // Force-clear any stuck rows (Safari can leave classes if DOM was partially updated).
+    if (filesContainer) {
+        filesContainer.querySelectorAll('.file-item.is-active').forEach((el) => {
+            if (el !== item) el.classList.remove('is-active');
+        });
+    } else if (activeFileItem) {
+        activeFileItem.classList.remove('is-active');
+    }
+
+    activeFileItem = item || null;
+    if (activeFileItem) {
+        activeFileItem.classList.add('is-active');
+    }
+}
+
+function clearActiveFileItem() {
+    setActiveFileItem(null);
+}
+
+/**
+ * Show file-actions via a single .is-active class (no CSS :hover).
+ */
+function setupFileRowHover() {
+    if (!filesContainer) return;
+
+    filesContainer.addEventListener('pointerover', (e) => {
+        if (e.pointerType === 'touch') return;
+        const item = e.target.closest('.file-item');
+        if (item && filesContainer.contains(item)) {
+            setActiveFileItem(item);
         }
-    ];
+    });
 
-    // Start with some default categories
-    categories = ['All files', 'Documents', 'Images', 'Design'];
-    renderCategories();
-    renderFiles();
-    updateStats();
+    filesContainer.addEventListener('pointerleave', (e) => {
+        if (e.pointerType === 'touch') return;
+        // Keep actions while focus is inside the row (e.g. <select>).
+        if (activeFileItem && activeFileItem.contains(document.activeElement)) {
+            return;
+        }
+        clearActiveFileItem();
+    });
+
+    filesContainer.addEventListener('focusin', (e) => {
+        const item = e.target.closest('.file-item');
+        if (item && filesContainer.contains(item)) {
+            setActiveFileItem(item);
+        }
+    });
+
+    filesContainer.addEventListener('focusout', () => {
+        requestAnimationFrame(() => {
+            if (!activeFileItem) return;
+            if (activeFileItem.contains(document.activeElement)) return;
+            // If pointer still over this row, keep actions (fine pointer only).
+            try {
+                if (activeFileItem.matches(':hover')) return;
+            } catch (_) { /* ignore */ }
+            clearActiveFileItem();
+        });
+    });
+
+    filesContainer.addEventListener('scroll', clearActiveFileItem, { passive: true });
+}
+
+function trapFocusInOpenModal(e) {
+    if (e.key !== 'Tab') return;
+    const modal = getOpenModal();
+    if (!modal) return;
+    const focusable = modal.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+    }
+}
+
+function normalizeCategories(raw) {
+    if (!Array.isArray(raw) || raw.length === 0) {
+        return [{ name: 'All files', parent: null }];
+    }
+    return raw.map(item => {
+        if (typeof item === 'string') {
+            return { name: item, parent: null };
+        }
+        return {
+            name: item.name,
+            parent: item.parent || null
+        };
+    });
+}
+
+function getCategoryNames() {
+    return categories.map(c => c.name);
+}
+
+function getCategoryMeta(name) {
+    return categories.find(c => c.name === name) || null;
+}
+
+function getChildCategories(parentName) {
+    return categories.filter(c => c.parent === parentName);
+}
+
+function hasChildren(categoryName) {
+    return categories.some(c => c.parent === categoryName);
+}
+
+function attachUndoTimerBar(element) {
+    removeUndoTimerBar(element);
+    element.classList.add('undo-pending');
+    const bar = document.createElement('div');
+    bar.className = 'undo-timer-bar';
+    bar.style.setProperty('--undo-ms', UNDO_DELAY_MS + 'ms');
+    bar.setAttribute('aria-hidden', 'true');
+    element.appendChild(bar);
+}
+
+function removeUndoTimerBar(element) {
+    if (!element) return;
+    element.classList.remove('undo-pending');
+    element.querySelectorAll('.undo-timer-bar').forEach(bar => bar.remove());
+}
+
+// Parent category shows own files + files from direct children.
+function getCategoryScopeNames(categoryName) {
+    if (categoryName === 'All files') {
+        return null; // all files
+    }
+    const names = [categoryName];
+    getChildCategories(categoryName).forEach(c => names.push(c.name));
+    return names;
+}
+
+function fileMatchesCategory(file, categoryName) {
+    if (categoryName === 'All files') return true;
+    const scope = getCategoryScopeNames(categoryName);
+    // Child category: only own files. Parent: own + children.
+    const meta = getCategoryMeta(categoryName);
+    if (meta && meta.parent) {
+        return file.category === categoryName;
+    }
+    return scope.includes(file.category);
+}
+
+async function loadData() {
+    try {
+        const response = await fetch('api.php?action=list');
+        const data = await response.json();
+
+        if (data.success) {
+            files = data.files || [];
+            categories = normalizeCategories(data.categories);
+            sharedCategories = new Set(data.sharedCategories || []);
+        }
+    } catch (error) {
+        console.error('Error loading data:', error);
+        showToast('Error loading data', 'error');
+    }
+}
+
+function createCategoryItem(categoryName, { isChild = false } = {}) {
+    const li = document.createElement('li');
+    const isActive = categoryName === currentCategory;
+    const children = getChildCategories(categoryName);
+    li.className = `category-item${isActive ? ' active' : ''}${isChild ? ' category-child' : ''}${children.length ? ' has-children' : ''}`;
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'category-name';
+    nameSpan.dataset.category = categoryName;
+    if (isChild) {
+        const indentIcon = document.createElement('span');
+        indentIcon.className = 'category-child-icon';
+        indentIcon.textContent = '└';
+        nameSpan.appendChild(indentIcon);
+    }
+    const nameText = document.createElement('span');
+    nameText.textContent = categoryName;
+    nameSpan.appendChild(nameText);
+    nameSpan.addEventListener('click', () => selectCategory(categoryName));
+
+    // Instant tooltip for long names (native title appears with a delay)
+    const tooltipLimit = isChild ? 18 : 22;
+    if (categoryName.length > tooltipLimit) {
+        li.dataset.tooltip = categoryName;
+    }
+
+    li.appendChild(nameSpan);
+
+    if (sharedCategories.has(categoryName)) {
+        const shareIcon = document.createElement('span');
+        shareIcon.className = 'category-share-icon';
+        shareIcon.title = 'Link access is open';
+        shareIcon.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-svg-small">
+                <path d="M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0" />
+                <path d="M6 21v-2a4 4 0 0 1 4 -4h3" />
+                <path d="M16 22l5 -5" />
+                <path d="M21 21.5v-4.5h-4.5" />
+            </svg>
+        `;
+        li.appendChild(shareIcon);
+    }
+
+    if (categoryName !== 'All files') {
+        const menuBtn = document.createElement('button');
+        menuBtn.className = 'category-btn-icon category-menu-btn';
+        menuBtn.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg-small">
+                <circle cx="6" cy="12" r="1.5" fill="currentColor"/>
+                <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
+                <circle cx="18" cy="12" r="1.5" fill="currentColor"/>
+            </svg>
+        `;
+        menuBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showCategoryMenu(e, categoryName);
+        });
+        li.appendChild(menuBtn);
+    }
+
+    return li;
 }
 
 function renderCategories() {
     categoriesList.innerHTML = '';
 
-    categories.forEach((category, index) => {
-        const li = document.createElement('li');
-        li.className = `category-item ${category === currentCategory ? 'active' : ''}`;
+    const roots = categories.filter(c => !c.parent);
 
-        const nameSpan = document.createElement('span');
-        nameSpan.className = 'category-name';
-        nameSpan.textContent = category;
-        nameSpan.addEventListener('click', () => selectCategory(category));
+    roots.forEach(cat => {
+        categoriesList.appendChild(createCategoryItem(cat.name));
 
-        li.appendChild(nameSpan);
-
-        if (category !== 'All files') {
-            const menuBtn = document.createElement('button');
-            menuBtn.className = 'category-btn-icon category-menu-btn';
-            menuBtn.innerHTML = `
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg-small">
-                    <circle cx="6" cy="12" r="1.5" fill="currentColor"/>
-                    <circle cx="12" cy="12" r="1.5" fill="currentColor"/>
-                    <circle cx="18" cy="12" r="1.5" fill="currentColor"/>
-                </svg>
-            `;
-            menuBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                showCategoryMenu(e, category);
+        if (hasChildren(cat.name)) {
+            getChildCategories(cat.name).forEach(child => {
+                categoriesList.appendChild(createCategoryItem(child.name, { isChild: true }));
             });
-            li.appendChild(menuBtn);
         }
-
-        categoriesList.appendChild(li);
     });
 }
 
 function selectCategory(category) {
     currentCategory = category;
+    hideSidebarTooltip();
     renderCategories();
     renderFiles();
+    updateStats();
+}
+
+let sidebarTooltip = null;
+
+// Tooltip to the right of the item; if there isn't enough room at the right edge of the window, wrap the text within the remaining width.
+function showSidebarTooltip(item) {
+    const text = item.dataset.tooltip;
+    if (!text) return;
+
+    if (!sidebarTooltip) {
+        sidebarTooltip = document.createElement('div');
+        sidebarTooltip.className = 'sidebar-tooltip';
+        document.body.appendChild(sidebarTooltip);
+    }
+
+    const gap = 8;
+    const margin = 8;
+    const rect = item.getBoundingClientRect();
+
+    sidebarTooltip.textContent = text;
+    sidebarTooltip.style.maxWidth = 'none';
+    sidebarTooltip.style.whiteSpace = 'nowrap';
+    sidebarTooltip.style.left = (rect.right + gap) + 'px';
+    sidebarTooltip.style.top = rect.top + 'px';
+    sidebarTooltip.style.display = 'block';
+
+    const available = window.innerWidth - (rect.right + gap) - margin;
+    if (sidebarTooltip.offsetWidth > available) {
+        sidebarTooltip.style.whiteSpace = 'normal';
+        sidebarTooltip.style.maxWidth = Math.max(available, 120) + 'px';
+    }
+}
+
+function hideSidebarTooltip() {
+    if (sidebarTooltip) sidebarTooltip.style.display = 'none';
+}
+
+/**
+ * Position a fixed context menu inside the viewport (flip up / clamp to edges).
+ * Uses clientX/clientY because menus are position: fixed.
+ */
+function positionContextMenu(menu, e) {
+    const margin = 10;
+    menu.style.display = 'block';
+    menu.style.visibility = 'hidden';
+    // Reset before measuring so previous open doesn't affect size
+    menu.style.left = '0px';
+    menu.style.top = '0px';
+    menu.style.right = 'auto';
+    menu.style.bottom = 'auto';
+
+    const menuWidth = menu.offsetWidth;
+    const menuHeight = menu.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    let x = e.clientX;
+    let y = e.clientY;
+
+    // Horizontal: open to the right of cursor, flip left if needed
+    if (x + menuWidth > vw - margin) {
+        x = Math.max(margin, vw - menuWidth - margin);
+    } else {
+        x = Math.max(margin, x);
+    }
+
+    // Vertical: open below cursor, flip above if not enough room
+    if (y + menuHeight > vh - margin) {
+        y = Math.max(margin, y - menuHeight);
+        // If still overflows (very tall menu), clamp to top and let it fill viewport
+        if (y + menuHeight > vh - margin) {
+            y = Math.max(margin, vh - menuHeight - margin);
+        }
+    } else {
+        y = Math.max(margin, y);
+    }
+
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+    menu.style.right = 'auto';
+    menu.style.bottom = 'auto';
+    menu.style.visibility = 'visible';
 }
 
 function showCategoryMenu(e, category) {
     currentCategoryForEdit = category;
-    categoryMenu.style.display = 'block';
-    categoryMenu.style.left = e.pageX + 'px';
-    categoryMenu.style.top = e.pageY + 'px';
+    revokeCategoryShareBtn.style.display = sharedCategories.has(category) ? '' : 'none';
+    // Subcategories only under top-level categories (not under "All files" or another subcategory)
+    const meta = getCategoryMeta(category);
+    const canAddSub = meta && !meta.parent && category !== 'All files';
+    addSubcategoryBtn.style.display = canAddSub ? '' : 'none';
+    positionContextMenu(categoryMenu, e);
+}
+
+function showFileMenu(e, file) {
+    currentFileForMenu = file;
+    positionContextMenu(fileMenu, e);
+}
+
+function populateCategoryParentSelect(categoryName) {
+    const meta = getCategoryMeta(categoryName);
+    const currentParent = meta ? meta.parent : null;
+    // Category with children cannot become a subcategory (only 1 nesting level).
+    const lockedAsRoot = hasChildren(categoryName);
+
+    categoryParentSelect.innerHTML = '';
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = '— Not linked —';
+    categoryParentSelect.appendChild(noneOpt);
+
+    if (!lockedAsRoot) {
+        categories
+            .filter(c => !c.parent && c.name !== 'All files' && c.name !== categoryName)
+            .forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.name;
+                opt.textContent = c.name;
+                categoryParentSelect.appendChild(opt);
+            });
+    }
+
+    categoryParentSelect.value = currentParent || '';
+    categoryParentSelect.disabled = lockedAsRoot;
 }
 
 function openCategoryModal(mode = 'create', categoryName = '') {
-    modalTitle.textContent = mode === 'create' ? 'New category' : 'Rename category';
+    if (mode === 'create') {
+        modalTitle.textContent = 'New category';
+    } else if (mode === 'create_sub') {
+        modalTitle.textContent = 'New subcategory';
+    } else {
+        modalTitle.textContent = 'Edit category';
+    }
     categoryNameInput.value = categoryName;
     categoryModal.style.display = 'flex';
+    categoryModal.setAttribute('role', 'dialog');
+    categoryModal.setAttribute('aria-modal', 'true');
     categoryNameInput.focus();
     categoryModal.dataset.mode = mode;
+    categoryModal.dataset.parent = mode === 'create_sub' ? (currentCategoryForEdit || '') : '';
+    if (mode === 'rename') {
+        categoryModal.dataset.renameFrom = currentCategoryForEdit || categoryName || '';
+        populateCategoryParentSelect(categoryModal.dataset.renameFrom);
+        categoryParentField.style.display = '';
+    } else {
+        categoryModal.dataset.renameFrom = '';
+        categoryParentField.style.display = 'none';
+        categoryParentSelect.innerHTML = '';
+        categoryParentSelect.disabled = false;
+    }
 }
 
 function closeCategoryModal() {
     categoryModal.style.display = 'none';
     categoryNameInput.value = '';
     currentCategoryForEdit = null;
+    categoryModal.dataset.mode = '';
+    categoryModal.dataset.parent = '';
+    categoryModal.dataset.renameFrom = '';
+    categoryParentField.style.display = 'none';
+    categoryParentSelect.innerHTML = '';
+    categoryParentSelect.disabled = false;
 }
 
 async function handleSaveCategory() {
@@ -232,41 +622,145 @@ async function handleSaveCategory() {
     }
 
     const mode = categoryModal.dataset.mode;
+    const parentForSub = categoryModal.dataset.parent || currentCategoryForEdit;
+    const renameFrom = categoryModal.dataset.renameFrom || currentCategoryForEdit;
 
-    if (mode === 'create') {
-        if (!categories.includes(name)) {
-            categories.push(name);
-            renderCategories();
-            showToast('Category created', 'success');
-        } else {
-            showToast('Category already exists', 'error');
-        }
-    } else {
-        const index = categories.indexOf(currentCategoryForEdit);
-        if (index !== -1) {
-            categories[index] = name;
-            // Update files in this category
-            files.forEach(f => {
-                if (f.category === currentCategoryForEdit) {
-                    f.category = name;
-                }
-            });
-
-            if (currentCategory === currentCategoryForEdit) {
-                currentCategory = name;
+    try {
+        if (mode === 'create' || mode === 'create_sub') {
+            const body = { action: 'category_create', name };
+            if (mode === 'create_sub' && parentForSub) {
+                body.parent = parentForSub;
             }
-            renderCategories();
-            renderFiles();
-            showToast('Category renamed', 'success');
-        }
-    }
 
-    closeCategoryModal();
+            const response = await fetch('api.php', {
+                method: 'POST',
+                headers: jsonHeaders('category_create'),
+                body: JSON.stringify(body)
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                categories = normalizeCategories(data.categories);
+                sharedCategories = new Set(data.sharedCategories || []);
+                renderCategories();
+                showToast(mode === 'create_sub' ? 'Subcategory created' : 'Category created', 'success');
+            } else {
+                showToast(data.error || 'Error creating category', 'error');
+            }
+        } else {
+            const parent = categoryParentSelect.disabled ? null : (categoryParentSelect.value || null);
+            const response = await fetch('api.php', {
+                method: 'POST',
+                headers: jsonHeaders('category_rename'),
+                body: JSON.stringify({
+                    action: 'category_rename',
+                    oldName: renameFrom,
+                    newName: name,
+                    parent
+                })
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                const oldName = renameFrom;
+                categories = normalizeCategories(data.categories);
+                files = data.files;
+                sharedCategories = new Set(data.sharedCategories || []);
+                if (currentCategory === oldName) {
+                    currentCategory = name;
+                }
+                renderCategories();
+                renderFiles();
+                showToast('Category saved', 'success');
+            } else {
+                showToast(data.error || 'Error saving category', 'error');
+            }
+        }
+
+        closeCategoryModal();
+    } catch (error) {
+        console.error('Error saving category:', error);
+        showToast('Error saving category', 'error');
+    }
+}
+
+function handleAddSubcategory() {
+    categoryMenu.style.display = 'none';
+    openCategoryModal('create_sub');
 }
 
 function handleRenameCategory() {
     categoryMenu.style.display = 'none';
     openCategoryModal('rename', currentCategoryForEdit);
+}
+
+function handleCategoryCopyLink() {
+    categoryMenu.style.display = 'none';
+    if (currentCategoryForEdit) {
+        copyCategoryLink(currentCategoryForEdit);
+    }
+}
+
+async function handleRevokeCategoryShare() {
+    categoryMenu.style.display = 'none';
+    const category = currentCategoryForEdit;
+    if (!category) return;
+
+    try {
+        const response = await fetch('api.php', {
+            method: 'POST',
+            headers: jsonHeaders('folder_unshare'),
+            body: JSON.stringify({ action: 'folder_unshare', category })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            sharedCategories.delete(category);
+            renderCategories();
+            showToast('Access revoked', 'success');
+        } else {
+            showToast(data.error || 'Error revoking access', 'error');
+        }
+    } catch (error) {
+        console.error('Error revoking folder share:', error);
+        showToast('Error revoking access', 'error');
+    }
+}
+
+// File menu handlers
+function handleFileCopy() {
+    fileMenu.style.display = 'none';
+    if (currentFileForMenu) {
+        copyLink(currentFileForMenu);
+    }
+}
+
+function handleFileOpen() {
+    fileMenu.style.display = 'none';
+    if (currentFileForMenu) {
+        openFile(currentFileForMenu);
+    }
+}
+
+function handleFileRenameMenu() {
+    fileMenu.style.display = 'none';
+    if (currentFileForMenu) {
+        renameFile(currentFileForMenu);
+    }
+}
+
+function handleFileReplaceMenu() {
+    fileMenu.style.display = 'none';
+    if (currentFileForMenu) {
+        replaceFile(currentFileForMenu);
+    }
+}
+
+function handleFileDeleteMenu() {
+    fileMenu.style.display = 'none';
+    if (currentFileForMenu) {
+        deleteFile(currentFileForMenu);
+    }
 }
 
 async function handleDeleteCategory() {
@@ -276,7 +770,7 @@ async function handleDeleteCategory() {
     let categoryElement = null;
     categoryItems.forEach(item => {
         const nameSpan = item.querySelector('.category-name');
-        if (nameSpan && nameSpan.textContent === currentCategoryForEdit) {
+        if (nameSpan && nameSpan.dataset.category === currentCategoryForEdit) {
             categoryElement = item;
         }
     });
@@ -296,6 +790,7 @@ async function handleDeleteCategory() {
     menuBtn.className = 'category-btn-icon category-undo-btn';
     menuBtn.innerHTML = `<img src="icons/undo.png" alt="Undo" class="icon-img">`;
     menuBtn.style.opacity = '1';
+    attachUndoTimerBar(categoryElement);
 
     const newMenuBtn = menuBtn.cloneNode(true);
     menuBtn.parentNode.replaceChild(newMenuBtn, menuBtn);
@@ -307,6 +802,7 @@ async function handleDeleteCategory() {
     const undoHandler = () => {
         cancelled = true;
         clearTimeout(undoTimeout);
+        removeUndoTimerBar(categoryElement);
         nameSpan.style.opacity = originalOpacity;
         currentMenuBtn.className = 'category-btn-icon category-menu-btn';
         currentMenuBtn.innerHTML = `
@@ -330,73 +826,83 @@ async function handleDeleteCategory() {
 
         menuBtn.removeEventListener('click', undoHandler);
 
-        // Local state update
-        const index = categories.indexOf(currentCategoryForEdit);
-        if (index !== -1) {
-            categories.splice(index, 1);
-
-            // Update files
-            files.forEach(f => {
-                if (f.category === currentCategoryForEdit) {
-                    f.category = 'Uncategorized';
-                }
+        try {
+            const response = await fetch('api.php', {
+                method: 'POST',
+                headers: jsonHeaders('category_delete'),
+                body: JSON.stringify({ action: 'category_delete', name: currentCategoryForEdit })
             });
+            const data = await response.json();
 
-            if (currentCategory === currentCategoryForEdit) {
-                currentCategory = 'All files';
+            if (data.success) {
+                const deletedName = currentCategoryForEdit;
+                categories = normalizeCategories(data.categories);
+                files = data.files;
+                sharedCategories = new Set(data.sharedCategories || []);
+                // Reset selection if deleted category (or its child) was active
+                if (currentCategory === deletedName || !getCategoryNames().includes(currentCategory)) {
+                    currentCategory = 'All files';
+                }
+                renderCategories();
+                renderFiles();
+                updateStats();
+                showToast('Category deleted', 'success');
+            } else {
+                showToast(data.error || 'Error deleting category', 'error');
+                removeUndoTimerBar(categoryElement);
+                nameSpan.style.opacity = originalOpacity;
             }
-            renderCategories();
-            renderFiles();
-            updateStats();
-            showToast('Category deleted', 'success');
-        } else {
+        } catch (error) {
+            console.error('Error deleting category:', error);
             showToast('Error deleting category', 'error');
+            removeUndoTimerBar(categoryElement);
             nameSpan.style.opacity = originalOpacity;
         }
-    }, 4000);
+    }, UNDO_DELAY_MS);
 }
 
 function renderFiles() {
-    let filteredFiles = files;
+    clearActiveFileItem();
 
-    if (currentCategory !== 'All files') {
-        filteredFiles = filteredFiles.filter(f => f.category === currentCategory);
-    }
+    let filteredFiles = files.filter(f => fileMatchesCategory(f, currentCategory));
 
     if (searchQuery) {
+        const q = searchQuery.toLowerCase();
         filteredFiles = filteredFiles.filter(f =>
-            f.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            f.id.toLowerCase().includes(searchQuery.toLowerCase())
+            f.name.toLowerCase().includes(q) ||
+            f.id.toLowerCase().includes(q)
         );
     }
 
     filteredFiles.sort((a, b) => {
         if (sortBy === 'date') {
             return new Date(b.uploadDate) - new Date(a.uploadDate);
-        } else {
-            return b.size - a.size;
         }
+        return b.size - a.size;
     });
 
-    filesContainer.innerHTML = '';
+    filesContainer.replaceChildren();
 
     if (filteredFiles.length === 0) {
-        const emptyMessage = searchQuery
-            ? 'Nothing found'
-            : 'No files';
-        filesContainer.innerHTML = `
-            <div class="empty-state">
-                <img src="icons/empty.png" alt="Empty" class="empty-state-icon">
-                <p>${emptyMessage}</p>
-            </div>
-        `;
+        const empty = document.createElement('div');
+        empty.className = 'empty-state';
+        const img = document.createElement('img');
+        img.src = 'icons/empty.png';
+        img.alt = '';
+        img.className = 'empty-state-icon';
+        const p = document.createElement('p');
+        p.textContent = searchQuery ? 'Nothing found' : 'No files';
+        empty.appendChild(img);
+        empty.appendChild(p);
+        filesContainer.appendChild(empty);
         return;
     }
 
+    const fragment = document.createDocumentFragment();
     filteredFiles.forEach(file => {
-        const fileItem = createFileItem(file);
-        filesContainer.appendChild(fileItem);
+        fragment.appendChild(createFileItem(file));
     });
+    filesContainer.appendChild(fragment);
 }
 
 function createFileItem(file) {
@@ -405,7 +911,7 @@ function createFileItem(file) {
 
     const icon = document.createElement('div');
     icon.className = 'file-icon';
-    icon.innerHTML = getFileIcon(file.extension, file.id);
+    appendFileIcon(icon, file.id);
 
     const info = document.createElement('div');
     info.className = 'file-info';
@@ -416,7 +922,7 @@ function createFileItem(file) {
 
     const meta = document.createElement('div');
     meta.className = 'file-meta';
-    const dateStr = file.modified ? `🔄 ${formatDate(file.uploadDate)}` : formatDate(file.uploadDate);
+    const dateStr = file.modified ? `🔄 ${formatDate(file.replacementDate || file.uploadDate)}` : formatDate(file.uploadDate);
     meta.textContent = `${dateStr} · ${formatSize(file.size)}`;
 
     info.appendChild(name);
@@ -425,16 +931,17 @@ function createFileItem(file) {
     const actions = document.createElement('div');
     actions.className = 'file-actions';
 
-    const copyBtn = createActionButton('copy-link.png', 'Скопировать ссылку', () => copyLink(file));
-    const openBtn = createActionButton('see-open.png', 'Открыть', () => openFile(file));
+    const copyBtn = createActionButton('copy-link.png', 'Copy link', () => copyLink(file));
+    const openBtn = createActionButton('see-open.png', 'Open', () => openFile(file));
 
     const categorySelect = document.createElement('select');
     categorySelect.className = 'category-select';
+    categorySelect.setAttribute('aria-label', 'File category');
     categories.forEach(cat => {
         const option = document.createElement('option');
-        option.value = cat;
-        option.textContent = cat;
-        option.selected = cat === file.category;
+        option.value = cat.name;
+        option.textContent = cat.parent ? `  ${cat.name}` : cat.name;
+        option.selected = cat.name === file.category;
         categorySelect.appendChild(option);
     });
     categorySelect.addEventListener('change', (e) => updateFileCategory(file.id, e.target.value));
@@ -450,37 +957,73 @@ function createFileItem(file) {
     actions.appendChild(deleteBtn);
     actions.appendChild(categorySelect);
 
+    const menuBtn = document.createElement('button');
+    menuBtn.className = 'file-menu-btn';
+    menuBtn.type = 'button';
+    menuBtn.setAttribute('aria-label', 'Actions menu');
+    menuBtn.title = 'Actions menu';
+    const menuSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    menuSvg.setAttribute('viewBox', '0 0 24 24');
+    menuSvg.setAttribute('class', 'icon-svg-small');
+    for (const cx of [6, 12, 18]) {
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('cx', String(cx));
+        c.setAttribute('cy', '12');
+        c.setAttribute('r', '1.5');
+        c.setAttribute('fill', 'currentColor');
+        menuSvg.appendChild(c);
+    }
+    menuBtn.appendChild(menuSvg);
+    menuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showFileMenu(e, file);
+    });
+
     div.appendChild(icon);
     div.appendChild(info);
     div.appendChild(actions);
+    div.appendChild(menuBtn);
 
     return div;
 }
 
 function createActionButton(iconFile, title, onClick, isDanger = false) {
     const btn = document.createElement('button');
+    btn.type = 'button';
     btn.className = `action-btn ${isDanger ? 'danger' : ''}`;
-    btn.innerHTML = `<img src="icons/${iconFile}" alt="${title}" class="icon-img">`;
     btn.title = title;
+    btn.setAttribute('aria-label', title);
+    const img = document.createElement('img');
+    img.src = 'icons/' + iconFile;
+    img.alt = '';
+    img.className = 'icon-img';
+    btn.appendChild(img);
     btn.addEventListener('click', onClick);
     return btn;
 }
 
-function getFileIcon(ext, fileId) {
+function appendFileIcon(container, fileId) {
     let hash = 0;
-    for (let i = 0; i < fileId.length; i++) {
-        hash = ((hash << 5) - hash) + fileId.charCodeAt(i);
+    const id = String(fileId || '');
+    for (let i = 0; i < id.length; i++) {
+        hash = ((hash << 5) - hash) + id.charCodeAt(i);
         hash = hash & hash;
     }
-
     const iconNumber = (Math.abs(hash) % 4) + 1;
-    const iconFile = `file-${iconNumber}.png`;
-
-    return `<img src="icons/${iconFile}" alt="${ext}" class="file-icon-img">`;
+    const img = document.createElement('img');
+    img.src = 'icons/file-' + iconNumber + '.png';
+    img.alt = '';
+    img.className = 'file-icon-img';
+    img.width = 40;
+    img.height = 40;
+    container.appendChild(img);
 }
 
 function formatDate(dateStr) {
     const date = new Date(dateStr);
+    if (Number.isNaN(date.getTime())) {
+        return '';
+    }
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const fileDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -502,8 +1045,9 @@ function formatDate(dateStr) {
 
 function formatSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
 let dragCounter = 0;
@@ -548,72 +1092,127 @@ function handleFileSelect(e) {
 }
 
 async function uploadFiles(filesToUpload) {
-    for (const file of filesToUpload) {
-        await uploadFile(file);
+    const queue = Array.from(filesToUpload);
+    if (queue.length === 0) return;
+
+    const workerCount = Math.min(UPLOAD_CONCURRENCY, queue.length);
+    const workers = [];
+    for (let i = 0; i < workerCount; i++) {
+        workers.push((async () => {
+            while (queue.length > 0) {
+                const next = queue.shift();
+                if (next) {
+                    await uploadFile(next);
+                }
+            }
+        })());
     }
+    await Promise.all(workers);
+}
+
+function clientFileExtension(fileName) {
+    const parts = String(fileName || '').split('.');
+    if (parts.length < 2) return '';
+    return parts.pop().toLowerCase();
 }
 
 async function uploadFile(file) {
-    // Simulate network delay for better UX
-    const btn = document.getElementById('uploadBtn');
-    const originalText = btn.textContent;
-    btn.textContent = 'Uploading...';
-    btn.disabled = true;
+    if (file.size > MAX_UPLOAD_BYTES) {
+        showToast(`File too large: ${file.name}`, 'error');
+        return;
+    }
+    const ext = clientFileExtension(file.name);
+    if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext)) {
+        showToast(`File type not allowed: ${file.name}`, 'error');
+        return;
+    }
 
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('action', 'upload');
+    formData.append('category', currentCategory);
+    addCsrfToken(formData, 'upload');
 
-    btn.textContent = originalText;
-    btn.disabled = false;
+    showToast(`Uploading: ${file.name}…`, 'info');
 
-    // Create a Blob URL
-    const blobUrl = URL.createObjectURL(file);
+    try {
+        const response = await fetch('api.php', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrfToken('upload') },
+            body: formData
+        });
+        const data = await response.json();
 
-    // Create new file object
-    const newFile = {
-        id: Date.now() + Math.random().toString(36).substr(2, 9),
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        url: blobUrl,
-        uploadDate: new Date().toISOString(),
-        category: currentCategory === 'All files' ? 'Uncategorized' : currentCategory,
-        extension: file.name.split('.').pop()
-    };
-
-    files.unshift(newFile); // Add to beginning
-    renderFiles();
-    updateStats();
-    showToast(`File uploaded: ${file.name}`, 'success');
+        if (data.success) {
+            files.push(data.file);
+            renderFiles();
+            updateStats();
+            showToast(`File uploaded: ${file.name}`, 'success');
+        } else {
+            showToast(data.error || 'Error uploading file', 'error');
+        }
+    } catch (error) {
+        console.error('Error uploading file:', error);
+        showToast('Error uploading file', 'error');
+    }
 }
 
 async function copyLink(file) {
-    const link = file.url;
+    const link = file.shareUrl || (window.location.origin + '/s/' + file.id + '/');
     await copyToClipboard(link);
     lastCopiedFileId = file.id;
     renderFiles();
-    showToast('Blob link copied to clipboard', 'success');
+    showToast('Link copied to clipboard', 'success');
+}
+
+async function copyCategoryLink(category) {
+    try {
+        const response = await fetch('api.php', {
+            method: 'POST',
+            headers: jsonHeaders('folder_share'),
+            body: JSON.stringify({ action: 'folder_share', category })
+        });
+        const data = await response.json();
+
+    if (data.success && data.shareId) {
+        const link = data.shareUrl || (window.location.origin + '/f/' + data.shareId);
+        await copyToClipboard(link);
+        sharedCategories.add(category);
+        renderCategories();
+        showToast('Folder link copied', 'success');
+    } else {
+        showToast(data.error || 'Error copying link', 'error');
+    }
+    } catch (error) {
+        console.error('Error copying folder link:', error);
+        showToast('Error copying link', 'error');
+    }
 }
 
 async function copyToClipboard(text) {
-    if (!navigator.clipboard) {
-        throw new Error('Clipboard API not available');
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
     }
 
-    try {
-        await navigator.clipboard.writeText(text);
-        console.log('Clipboard write successful');
-    } catch (err) {
-        console.error('Clipboard write failed:', err);
-        throw err;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+
+    if (!copied) {
+        throw new Error('Clipboard API is not available');
     }
 }
 
 function openFile(file) {
-    if (file.url) {
-        window.open(file.url, '_blank');
-    } else {
-        showToast('File URL not found', 'error');
-    }
+    const link = file.previewUrl || ('/s/' + file.id + '.' + file.extension);
+    window.open(link, '_blank');
 }
 
 let currentFileForRename = null;
@@ -625,6 +1224,8 @@ function renameFile(file) {
 
     fileNameInput.value = file.name;
     fileRenameModal.style.display = 'flex';
+    fileRenameModal.setAttribute('aria-modal', 'true');
+    fileRenameModal.setAttribute('role', 'dialog');
 
     setTimeout(() => {
         fileNameInput.focus();
@@ -640,14 +1241,28 @@ async function handleSaveFileRename() {
         return;
     }
 
-    const fileIndex = files.findIndex(f => f.id === currentFileForRename.id);
-    if (fileIndex !== -1) {
-        files[fileIndex].name = newName;
-        // Update extension if the user changed it? usually we keep extension, but for demo let's just take the name
-        // Ideally we should preserve extension if not provided, but let's keep it simple
-        renderFiles();
-        updateStats();
-        showToast('File renamed', 'success');
+    try {
+        const response = await fetch('api.php', {
+            method: 'POST',
+            headers: jsonHeaders('rename'),
+            body: JSON.stringify({ action: 'rename', id: currentFileForRename.id, name: newName })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            const fileIndex = files.findIndex(f => f.id === currentFileForRename.id);
+            if (fileIndex !== -1) {
+                files[fileIndex].name = newName;
+                renderFiles();
+                updateStats();
+                showToast('File renamed', 'success');
+            }
+        } else {
+            showToast(data.error || 'Error renaming file', 'error');
+        }
+    } catch (error) {
+        console.error('Error renaming file:', error);
+        showToast('Error renaming file', 'error');
     }
 
     closeFileRenameModal();
@@ -670,25 +1285,47 @@ function replaceFile(file) {
             return;
         }
 
-        // Simulate upload delay
-        showToast('Replacing file...', 'info');
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (newFile.size > MAX_UPLOAD_BYTES) {
+            showToast('File too large', 'error');
+            document.body.removeChild(input);
+            return;
+        }
+        const ext = clientFileExtension(newFile.name);
+        if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext)) {
+            showToast('File type not allowed', 'error');
+            document.body.removeChild(input);
+            return;
+        }
 
-        const blobUrl = URL.createObjectURL(newFile);
+        const formData = new FormData();
+        formData.append('file', newFile);
+        formData.append('action', 'replace');
+        formData.append('id', file.id);
+        addCsrfToken(formData, 'replace');
 
-        const fileIndex = files.findIndex(f => f.id === file.id);
-        if (fileIndex !== -1) {
-            files[fileIndex] = {
-                ...files[fileIndex],
-                name: newFile.name,
-                size: newFile.size,
-                type: newFile.type,
-                url: blobUrl,
-                uploadDate: new Date().toISOString(),
-                extension: newFile.name.split('.').pop()
-            };
-            renderFiles();
-            showToast('File replaced', 'success');
+        showToast('Replacing file…', 'info');
+
+        try {
+            const response = await fetch('api.php', {
+                method: 'POST',
+                headers: { 'X-CSRF-Token': csrfToken('replace') },
+                body: formData
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                const fileIndex = files.findIndex(f => f.id === file.id);
+                if (fileIndex !== -1) {
+                    files[fileIndex] = data.file;
+                    renderFiles();
+                    showToast('File replaced', 'success');
+                }
+            } else {
+                showToast(data.error || 'Error replacing file', 'error');
+            }
+        } catch (error) {
+            console.error('Error replacing file:', error);
+            showToast('Error replacing file', 'error');
         }
 
         document.body.removeChild(input);
@@ -725,18 +1362,18 @@ function deleteFile(file) {
     fileMeta.style.opacity = '0.9';
     fileMeta.textContent = 'File deleted';
     fileActions.innerHTML = `
-        <button class="action-btn undo-btn" title="Cancel deletion">
+        <button class="action-btn undo-btn" title="Undo delete">
             <img src="icons/undo.png" alt="Undo" class="icon-img">
         </button>
     `;
+    attachUndoTimerBar(fileElement);
 
     const undoBtn = fileActions.querySelector('.undo-btn');
     let undoTimeout = null;
     let cancelled = false;
 
-    const undoHandler = () => {
-        cancelled = true;
-        clearTimeout(undoTimeout);
+    const restoreFileRow = () => {
+        removeUndoTimerBar(fileElement);
         fileName.style.opacity = originalNameOpacity;
         fileIcon.style.opacity = originalIconOpacity;
         fileMeta.style.opacity = originalMetaOpacity;
@@ -758,32 +1395,74 @@ function deleteFile(file) {
         if (categorySelect) categorySelect.addEventListener('change', (e) => updateFileCategory(file.id, e.target.value));
     };
 
+    const undoHandler = () => {
+        cancelled = true;
+        clearTimeout(undoTimeout);
+        restoreFileRow();
+    };
+
     undoBtn.addEventListener('click', undoHandler);
 
     undoTimeout = setTimeout(async () => {
         if (cancelled) return;
 
-        // Finalize deletion (just remove from local array)
-        files = files.filter(f => f.id !== file.id);
-        renderFiles();
-        updateStats();
-        showToast('File deleted', 'success');
-    }, 4000);
+        try {
+            const response = await fetch('api.php', {
+                method: 'POST',
+                headers: jsonHeaders('delete'),
+                body: JSON.stringify({ action: 'delete', id: file.id })
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                files = files.filter(f => f.id !== file.id);
+                renderFiles();
+                updateStats();
+                showToast('File deleted', 'success');
+            } else {
+                showToast(data.error || 'Error deleting file', 'error');
+                restoreFileRow();
+            }
+        } catch (error) {
+            console.error('Error deleting file:', error);
+            showToast('Error deleting file', 'error');
+            restoreFileRow();
+        }
+    }, UNDO_DELAY_MS);
 }
 
 async function updateFileCategory(fileId, newCategory) {
-    const fileIndex = files.findIndex(f => f.id === fileId);
-    if (fileIndex !== -1) {
-        files[fileIndex].category = newCategory;
-        renderFiles();
-        showToast('Category updated', 'success');
+    try {
+        const response = await fetch('api.php', {
+            method: 'POST',
+            headers: jsonHeaders('update_category'),
+            body: JSON.stringify({ action: 'update_category', id: fileId, category: newCategory })
+        });
+        const data = await response.json();
+
+        if (data.success) {
+            const fileIndex = files.findIndex(f => f.id === fileId);
+            if (fileIndex !== -1) {
+                files[fileIndex].category = newCategory;
+                renderFiles();
+                showToast('Category updated', 'success');
+            }
+        } else {
+            showToast(data.error || 'Error updating category', 'error');
+        }
+    } catch (error) {
+        console.error('Error updating category:', error);
+        showToast('Error updating category', 'error');
     }
 }
 
 function handleSearch(e) {
     searchQuery = e.target.value;
     clearSearch.style.display = searchQuery ? 'block' : 'none';
-    renderFiles();
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+        renderFiles();
+    }, 200);
 }
 
 function handleClearSearch() {
@@ -793,13 +1472,19 @@ function handleClearSearch() {
     renderFiles();
 }
 
-function handleSortToggle() {
-    sortBy = sortBy === 'date' ? 'size' : 'date';
-    const sortIcon = document.getElementById('sortIcon');
-    sortIcon.src = sortBy === 'date' ? 'icons/filter-date.png' : 'icons/filter-size.png';
-    const message = sortBy === 'date' ? 'Sorted by date' : 'Sorted by size';
-    showToast(message, 'info');
+function setSortBy(nextSort) {
+    if (sortBy === nextSort) return;
+    sortBy = nextSort;
+    updateSortTabs();
     renderFiles();
+}
+
+function updateSortTabs() {
+    const isDate = sortBy === 'date';
+    sortByDate.classList.toggle('active', isDate);
+    sortByDate.setAttribute('aria-selected', isDate ? 'true' : 'false');
+    sortBySize.classList.toggle('active', !isDate);
+    sortBySize.setAttribute('aria-selected', !isDate ? 'true' : 'false');
 }
 
 function updateStats() {
@@ -807,20 +1492,24 @@ function updateStats() {
     const totalSize = document.getElementById('totalSize');
     const todayCount = document.getElementById('todayCount');
 
-    fileCount.textContent = files.length;
+    const scoped = files.filter(f => fileMatchesCategory(f, currentCategory));
 
-    const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+    fileCount.textContent = scoped.length;
+
+    const totalBytes = scoped.reduce((sum, f) => sum + f.size, 0);
     totalSize.textContent = formatSize(totalBytes);
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const todayFiles = files.filter(f => new Date(f.uploadDate) >= today);
+    const todayFiles = scoped.filter(f => new Date(f.uploadDate) >= today);
     todayCount.textContent = todayFiles.length;
 }
 
 function showToast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
 
     const msg = document.createElement('span');
     msg.className = 'toast-message';
@@ -829,9 +1518,12 @@ function showToast(message, type = 'info') {
     toast.appendChild(msg);
     toastContainer.appendChild(toast);
 
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     setTimeout(() => {
-        toast.style.animation = 'slideIn 0.3s ease reverse';
-        setTimeout(() => toast.remove(), 300);
+        if (!reduceMotion) {
+            toast.style.animation = 'slideIn 0.3s ease reverse';
+        }
+        setTimeout(() => toast.remove(), reduceMotion ? 0 : 300);
     }, 3000);
 }
 

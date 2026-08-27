@@ -1,132 +1,71 @@
-# Security Recommendations
+# Security
 
-## Important Security Notes
+Single-admin file sharing application. Public links to files (`/s/{id}`) and folders (`/f/{id}`) are **intentionally public**: knowing the link means access to the content.
 
-### 🔐 Password Security
+## Implemented mitigations
 
-1. **Change the default password immediately** after installation
-2. Use a strong password with at least 12 characters
-3. Include uppercase, lowercase, numbers, and special characters
-4. Never commit your password hash to public repositories
+| Measure | Where |
+|---|---|
+| Built-in bootstrap password (`DemoPassword`) or optional configured hash; bcrypt password hashing | `config.php`, `auth.php` |
+| Session: HttpOnly, SameSite=Lax, Secure on HTTPS, strict mode | `auth.php` |
+| Idle 14d / absolute 30d timeout, session regenerate | `auth.php` |
+| Login rate-limit (5 fails / 30 min → block 30 min) | `auth.php` + SQLite |
+| CSRF tokens + same-host Origin/Referer on POST | `auth.php` |
+| Prepared statements | `api.php`, `db.php` |
+| Upload whitelist + finfo MIME check | `api.php` |
+| Random 5-character share IDs and path containment | `api.php` |
+| No PHP execution under `/s/` | `s/.htaccess` |
+| Security headers (CSP, nosniff, Referrer, Frame, HSTS) | `security_headers.php`, `.htaccess` |
+| `data/` and `config.php` denied from web | `.htaccess`, `nginx-share-routes.conf` |
+| Audit log (login, upload, delete, ...) | `audit_log` table |
+| `.env`, `config.php`, SQLite, and uploads excluded from Git | `.gitignore` |
 
-### 🌐 HTTPS
+## Post-install / post-deploy checklist
 
-**Always use HTTPS in production.** File links are not encrypted over HTTP.
+1. Before public deployment, either create `config.php` from `config.example.php` with a unique bootstrap hash, or sign in with `DemoPassword` and change it immediately through the UI. Never commit or expose `config.php`.
+2. **HTTPS** enabled (`.htaccess` already redirects, honoring `X-Forwarded-Proto`).
+3. For nginx, add the `data/` and `config.php` denial rules from `nginx-share-routes.conf` to the server block.
+4. PHP `display_errors=Off` in production.
+5. If the site is behind a reverse proxy that isn't localhost, define `TRUSTED_PROXIES` with the proxy IP addresses before serving requests; otherwise `X-Forwarded-Proto` is not trusted.
+6. Permissions: `data/` and `s/` are writable by PHP, not world-writable unnecessarily.
+7. Back up the SQLite database and `s/` uploads using your hosting provider or an access-controlled backup process.
 
-To enable HTTPS:
-- Get a free SSL certificate from [Let's Encrypt](https://letsencrypt.org/)
-- Or use your hosting provider's SSL option
-- Update `.htaccess` to force HTTPS:
+## File uploads
 
-```apache
-RewriteEngine On
-RewriteCond %{HTTPS} off
-RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
-```
+Allowed extensions: `pdf`, `doc`, `docx`, `odp`, `pptm`, `jpg`, `jpeg`, `png`, `zip`, `mp4`, `mov`.
 
-### 📁 File Access Control
+Limit: 100 MB. Extension is normalized; MIME is checked via `finfo` when available.
 
-**Important:** Files in `/s/` directory are publicly accessible by anyone with the link.
+HTML/PHP/SVG/JS **cannot** be uploaded through the API. `/s/` additionally has the PHP engine disabled.
 
-- Do not upload sensitive/confidential documents without additional encryption
-- Consider adding IP restrictions if needed
-- Regularly review uploaded files
+## Public links
 
-### 🔒 Additional Security Measures
+- Files: `/s/{id}/` (share page) and `/s/{id}.{ext}` (direct file).
+- Folders: `/f/{shareId}`.
+- Links use 5 random characters. Do not rely on link secrecy as the only protection for confidential content.
 
-#### IP Whitelist (Optional)
+Don't upload confidential documents without a separate access policy.
 
-Add to `.htaccess` to restrict admin access by IP:
+## Deploy
 
-```apache
-<Files "index.php">
-    Order Deny,Allow
-    Deny from all
-    Allow from 123.456.789.0
-    Allow from 192.168.1.0/24
-</Files>
+- `deploy.sh pull|push` — full sync (code + `data/` + `s/`), **excludes** `.env`, `USELESS/`, `tests/`, and `backups/`.
+- `pull` stops if local files are newer than the server's (`pull --force` to override).
+- `FTP_SSL=1` in `.env` enables FTPS (if the host supports it).
+- `php -l` runs against root-level `*.php` before push.
 
-<Files "api.php">
-    Order Deny,Allow
-    Deny from all
-    Allow from 123.456.789.0
-    Allow from 192.168.1.0/24
-</Files>
-```
+## Monitoring
 
-#### Session Security
+- `audit_log` table (action, target_id, ip, created_at)
+- Web server access/error logs (login brute-force attempts)
+- Unusual upload/delete activity in the audit log
 
-The application uses PHP sessions with these settings:
-- Session-based authentication
-- Secure logout that destroys sessions
-- Progressive lockout after failed attempts
+## Known limitations
 
-Consider adding to `auth.php`:
+1. No at-rest file encryption.
+2. Single admin account (no RBAC).
+3. "Link = access" model for public files/folders.
+4. PDF compression via Ghostscript runs after the response (shutdown hook) and requires `gs` in `PATH`.
 
-```php
-// Add session timeout (optional)
-ini_set('session.gc_maxlifetime', 3600); // 1 hour
-session_set_cookie_params(3600);
-```
+## Reporting a vulnerability
 
-#### File Upload Validation
-
-Current validation:
-- ✅ File size limit (100MB default)
-- ✅ Unique file IDs
-- ❌ No file type restrictions
-
-To add file type restrictions, edit `api.php`:
-
-```php
-$allowedExtensions = ['pdf', 'jpg', 'png', 'doc', 'docx', 'txt'];
-$extension = pathinfo($originalName, PATHINFO_EXTENSION);
-
-if (!in_array(strtolower($extension), $allowedExtensions)) {
-    echo json_encode(['success' => false, 'error' => 'File type not allowed']);
-    exit;
-}
-```
-
-### 🗄️ Backup
-
-**Regular backups are essential:**
-
-```bash
-# Backup data directory
-tar -czf backup-$(date +%Y%m%d).tar.gz data/ s/
-
-# Or use rsync
-rsync -av data/ s/ /path/to/backup/
-```
-
-### 🔍 Monitoring
-
-Monitor these files for suspicious activity:
-- `data/files.json` - Check for unusual uploads
-- Apache access logs - Monitor for brute force attempts
-- Apache error logs - Check for errors
-
-### ⚠️ Known Limitations
-
-1. **No file encryption** - Files are stored as-is
-2. **No user management** - Single password for all users
-3. **No audit log** - No tracking of who uploaded what
-4. **Public file access** - Anyone with link can download
-
-### 🛡️ Best Practices
-
-- [ ] Use HTTPS
-- [ ] Change default password
-- [ ] Set strong password
-- [ ] Enable regular backups
-- [ ] Monitor access logs
-- [ ] Keep PHP updated
-- [ ] Restrict file types if needed
-- [ ] Consider IP whitelist for admin
-- [ ] Don't upload sensitive files
-- [ ] Review uploaded files regularly
-
-## Reporting Security Issues
-
-If you find a security vulnerability, please report it via GitHub issues.
+Contact the host administrator through a private channel; do not publish a PoC with working credentials.

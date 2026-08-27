@@ -1,14 +1,32 @@
 <?php
-require_once 'auth.php';
+require_once __DIR__ . '/security_headers.php';
+require_once __DIR__ . '/auth.php';
+send_security_headers('app');
 requireAuth();
+
+$csrfActions = [
+    'category_create',
+    'category_rename',
+    'category_delete',
+    'folder_share',
+    'folder_unshare',
+    'upload',
+    'replace',
+    'rename',
+    'delete',
+    'update_category',
+];
+$cssV = asset_version('style.css');
+$jsV = asset_version('app.js');
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Drive</title>
-    <link rel="stylesheet" href="style.css">
+    <title>File Drive</title>
+    <meta name="robots" content="noindex, nofollow">
+    <link rel="stylesheet" href="style.css?v=<?php echo htmlspecialchars($cssV, ENT_QUOTES); ?>">
     <link rel="icon" href="favicon.ico">
 </head>
 <body>
@@ -35,7 +53,7 @@ requireAuth();
             <div class="drop-zone-content">
                 <img src="icons/cloud.png" alt="Upload" class="upload-icon">
                 <button class="btn-primary" id="uploadBtn">Upload document</button>
-                <p class="drop-zone-text">or drag and drop it here</p>
+                <p class="drop-zone-text">or drag it here</p>
             </div>
         </div>
 
@@ -46,9 +64,14 @@ requireAuth();
                 <input type="text" id="searchInput" placeholder="Search by name or link" class="search-input">
                 <button class="btn-clear" id="clearSearch" style="display: none;">✕</button>
             </div>
-            <button class="btn-icon sort-toggle" id="sortToggle" title="Sort">
-                <img src="icons/filter-date.png" alt="Sort" class="icon-img" id="sortIcon">
-            </button>
+            <div class="sort-tabs" role="tablist" aria-label="Sorting">
+                <button class="sort-tab" id="sortByDate" role="tab" aria-selected="true" title="Sort by date">
+                    <img src="icons/filter-date.png" alt="By date" class="icon-img">
+                </button>
+                <button class="sort-tab" id="sortBySize" role="tab" aria-selected="false" title="Sort by size">
+                    <img src="icons/filter-size.png" alt="By size" class="icon-img">
+                </button>
+            </div>
         </div>
 
         <!-- Files list -->
@@ -61,13 +84,17 @@ requireAuth();
             <span>Files: <span id="fileCount">0</span></span>
             <span>Size: <span id="totalSize">0 MB</span></span>
             <span>Today: <span id="todayCount">0</span></span>
-            <a href="logout.php" class="btn-ui-icon" title="Logout" style="margin-left: auto;">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
-                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>
-                    <polyline points="16 17 21 12 16 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-                    <line x1="21" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                </svg>
-            </a>
+            <a href="change-password.php" class="btn-secondary" style="margin-left: auto; text-decoration: none;">Change password</a>
+            <form method="POST" action="logout.php" style="margin: 0;">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(csrf_token('logout_admin'), ENT_QUOTES); ?>">
+                <button type="submit" class="btn-ui-icon" title="Log out">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
+                        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>
+                        <polyline points="16 17 21 12 16 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+                        <line x1="21" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </form>
         </div>
     </main>
 
@@ -91,6 +118,12 @@ requireAuth();
             </div>
             <div class="modal-body">
                 <input type="text" id="categoryNameInput" placeholder="Category name" class="modal-input">
+                <div class="modal-field" id="categoryParentField" style="display: none;">
+                    <label for="categoryParentSelect" class="modal-label">Linked to</label>
+                    <select id="categoryParentSelect" class="modal-input">
+                        <option value="">— Not linked —</option>
+                    </select>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-secondary" id="cancelModal">Cancel</button>
@@ -123,33 +156,58 @@ requireAuth();
 
     <!-- Category actions menu -->
     <div class="context-menu" id="categoryMenu" style="display: none;">
+        <button class="menu-item" id="addSubcategoryBtn">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-img-inline" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg> Subcategory
+        </button>
+        <button class="menu-item" id="copyCategoryLinkBtn">
+            <img src="icons/copy-link.png" alt="Copy" class="icon-img-inline"> Copy link
+        </button>
+        <button class="menu-item" id="revokeCategoryShareBtn" style="display: none;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-img-inline">
+                <path d="M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0" />
+                <path d="M6 21v-2a4 4 0 0 1 4 -4h3" />
+                <path d="M16 22l5 -5" />
+                <path d="M21 21.5v-4.5h-4.5" />
+            </svg> Revoke access
+        </button>
         <button class="menu-item" id="renameCategoryBtn">
-            <img src="icons/edit.png" alt="Edit" class="icon-img-inline"> Rename
+            <img src="icons/edit.png" alt="Edit" class="icon-img-inline"> Edit
         </button>
         <button class="menu-item menu-item-danger" id="deleteCategoryBtn">
             <img src="icons/delete.png" alt="Delete" class="icon-img-inline"> Delete
         </button>
     </div>
 
-    <!-- File actions menu -->
-    <div class="context-menu" id="fileActionsMenu" style="display: none;">
-        <button class="menu-item" id="fileMenuCopyLink">
-            <img src="icons/copy-link.png" alt="Copy" class="icon-img-inline"> Copy link
+    <!-- File actions menu (mobile) -->
+    <div class="context-menu" id="fileMenu" style="display: none;">
+        <button class="menu-item" id="fileCopyBtn">
+            <img src="icons/copy-link.png" alt="Copy" class="icon-img-inline"> Copy
         </button>
-        <button class="menu-item" id="fileMenuOpen">
+        <button class="menu-item" id="fileOpenBtn">
             <img src="icons/see-open.png" alt="Open" class="icon-img-inline"> Open
         </button>
-        <button class="menu-item" id="fileMenuRename">
+        <button class="menu-item" id="fileRenameBtn">
             <img src="icons/edit.png" alt="Rename" class="icon-img-inline"> Rename
         </button>
-        <button class="menu-item" id="fileMenuReplace">
+        <button class="menu-item" id="fileReplaceBtn">
             <img src="icons/update.png" alt="Replace" class="icon-img-inline"> Replace
         </button>
-        <button class="menu-item menu-item-danger" id="fileMenuDelete">
+        <button class="menu-item menu-item-danger" id="fileDeleteBtn">
             <img src="icons/delete.png" alt="Delete" class="icon-img-inline"> Delete
         </button>
     </div>
 
-    <script src="app.js"></script>
+    <script>
+        window.DISK_CSRF_TOKENS = <?php
+            echo json_encode(array_reduce($csrfActions, function ($tokens, $action) {
+                $tokens[$action] = csrf_token($action);
+                return $tokens;
+            }, []), JSON_UNESCAPED_SLASHES);
+        ?>;
+    </script>
+    <script src="app.js?v=<?php echo htmlspecialchars($jsV, ENT_QUOTES); ?>"></script>
 </body>
 </html>

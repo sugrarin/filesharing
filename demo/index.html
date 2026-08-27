@@ -1,14 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Filesharing Demo</title>
+    <title>File Sharing Demo</title>
+    <meta name="robots" content="noindex, nofollow">
     <link rel="stylesheet" href="style.css">
-    <link rel="icon" href="favicon.ico">
 </head>
-
 <body>
     <!-- Sidebar with categories -->
     <aside class="sidebar">
@@ -16,10 +14,8 @@
             <h2>Categories</h2>
             <button class="btn-ui-icon" id="addCategoryBtn" title="Add category">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
-                    <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" />
-                    <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" />
+                    <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 </svg>
             </button>
         </div>
@@ -30,12 +26,16 @@
 
     <!-- Main content area -->
     <main class="main-content">
+        <div class="demo-notice" role="status">
+            <span>Demo mode: changes are stored only in this browser.</span>
+            <button type="button" class="btn-secondary demo-reset-btn" id="resetDemoBtn">Reset demo</button>
+        </div>
         <!-- Drop zone -->
         <div class="drop-zone" id="dropZone">
             <div class="drop-zone-content">
                 <img src="icons/cloud.png" alt="Upload" class="upload-icon">
                 <button class="btn-primary" id="uploadBtn">Upload document</button>
-                <p class="drop-zone-text">or drag and drop it here</p>
+                <p class="drop-zone-text">or drag it here</p>
             </div>
         </div>
 
@@ -46,9 +46,14 @@
                 <input type="text" id="searchInput" placeholder="Search by name or link" class="search-input">
                 <button class="btn-clear" id="clearSearch" style="display: none;">✕</button>
             </div>
-            <button class="btn-icon sort-toggle" id="sortToggle" title="Sort">
-                <img src="icons/filter-date.png" alt="Sort" class="icon-img" id="sortIcon">
-            </button>
+            <div class="sort-tabs" role="tablist" aria-label="Sorting">
+                <button class="sort-tab" id="sortByDate" role="tab" aria-selected="true" title="Sort by date">
+                    <img src="icons/filter-date.png" alt="By date" class="icon-img">
+                </button>
+                <button class="sort-tab" id="sortBySize" role="tab" aria-selected="false" title="Sort by size">
+                    <img src="icons/filter-size.png" alt="By size" class="icon-img">
+                </button>
+            </div>
         </div>
 
         <!-- Files list -->
@@ -61,16 +66,7 @@
             <span>Files: <span id="fileCount">0</span></span>
             <span>Size: <span id="totalSize">0 MB</span></span>
             <span>Today: <span id="todayCount">0</span></span>
-            <a href="logout.php" class="btn-ui-icon" title="Logout" style="margin-left: auto;">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
-                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" fill="none" />
-                    <polyline points="16 17 21 12 16 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-                        stroke-linejoin="round" fill="none" />
-                    <line x1="21" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" />
-                </svg>
-            </a>
+            <span style="margin-left: auto;">No installation required</span>
         </div>
     </main>
 
@@ -87,15 +83,19 @@
                 <h3 id="modalTitle">New category</h3>
                 <button class="btn-ui-icon" id="closeModal">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
-                        <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2"
-                            stroke-linecap="round" />
-                        <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"
-                            stroke-linecap="round" />
+                        <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                     </svg>
                 </button>
             </div>
             <div class="modal-body">
                 <input type="text" id="categoryNameInput" placeholder="Category name" class="modal-input">
+                <div class="modal-field" id="categoryParentField" style="display: none;">
+                    <label for="categoryParentSelect" class="modal-label">Linked to</label>
+                    <select id="categoryParentSelect" class="modal-input">
+                        <option value="">— Not linked —</option>
+                    </select>
+                </div>
             </div>
             <div class="modal-footer">
                 <button class="btn-secondary" id="cancelModal">Cancel</button>
@@ -111,10 +111,8 @@
                 <h3>Rename file</h3>
                 <button class="btn-ui-icon" id="closeFileRenameModal">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-svg">
-                        <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2"
-                            stroke-linecap="round" />
-                        <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2"
-                            stroke-linecap="round" />
+                        <line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                     </svg>
                 </button>
             </div>
@@ -130,15 +128,52 @@
 
     <!-- Category actions menu -->
     <div class="context-menu" id="categoryMenu" style="display: none;">
+        <button class="menu-item" id="addSubcategoryBtn">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" class="icon-img-inline" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"/>
+                <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg> Subcategory
+        </button>
+        <button class="menu-item" id="copyCategoryLinkBtn">
+            <img src="icons/copy-link.png" alt="Copy" class="icon-img-inline"> Copy link
+        </button>
+        <button class="menu-item" id="revokeCategoryShareBtn" style="display: none;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-img-inline">
+                <path d="M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0" />
+                <path d="M6 21v-2a4 4 0 0 1 4 -4h3" />
+                <path d="M16 22l5 -5" />
+                <path d="M21 21.5v-4.5h-4.5" />
+            </svg> Revoke access
+        </button>
         <button class="menu-item" id="renameCategoryBtn">
-            <img src="icons/edit.png" alt="Edit" class="icon-img-inline"> Rename
+            <img src="icons/edit.png" alt="Edit" class="icon-img-inline"> Edit
         </button>
         <button class="menu-item menu-item-danger" id="deleteCategoryBtn">
             <img src="icons/delete.png" alt="Delete" class="icon-img-inline"> Delete
         </button>
     </div>
 
+    <!-- File actions menu (mobile) -->
+    <div class="context-menu" id="fileMenu" style="display: none;">
+        <button class="menu-item" id="fileCopyBtn">
+            <img src="icons/copy-link.png" alt="Copy" class="icon-img-inline"> Copy
+        </button>
+        <button class="menu-item" id="fileOpenBtn">
+            <img src="icons/see-open.png" alt="Open" class="icon-img-inline"> Open
+        </button>
+        <button class="menu-item" id="fileRenameBtn">
+            <img src="icons/edit.png" alt="Rename" class="icon-img-inline"> Rename
+        </button>
+        <button class="menu-item" id="fileReplaceBtn">
+            <img src="icons/update.png" alt="Replace" class="icon-img-inline"> Replace
+        </button>
+        <button class="menu-item menu-item-danger" id="fileDeleteBtn">
+            <img src="icons/delete.png" alt="Delete" class="icon-img-inline"> Delete
+        </button>
+    </div>
+
+    <script>window.DISK_CSRF_TOKENS = {};</script>
+    <script src="demo-api.js"></script>
     <script src="app.js"></script>
 </body>
-
 </html>

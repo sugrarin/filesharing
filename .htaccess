@@ -1,0 +1,61 @@
+# Disallow directory listing
+Options -Indexes
+
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    # HSTS only when the request already arrived as HTTPS (incl. behind proxy).
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTPS
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTP_X_FORWARDED_PROTO_HTTPS
+
+    # Long-cache immutable static assets
+    <FilesMatch "\.(ico|png|jpg|jpeg|gif|webp|svg|woff2?)$">
+        Header set Cache-Control "public, max-age=604800, immutable"
+    </FilesMatch>
+    <FilesMatch "\.(js|css)$">
+        Header set Cache-Control "public, max-age=86400"
+    </FilesMatch>
+</IfModule>
+
+# Map X-Forwarded-Proto=https for HSTS env (Apache 2.4+)
+SetEnvIf X-Forwarded-Proto "^https$" HTTP_X_FORWARDED_PROTO_HTTPS=1
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # === REDIRECT HTTP -> HTTPS (PROXY-AWARE) ===
+    RewriteCond %{HTTPS} off
+    RewriteCond %{HTTP:X-Forwarded-Proto} !https
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+    # ================================================
+
+    # Shared folder pages
+    RewriteRule ^f/([A-Za-z]{5})$ folder.php?id=$1 [L,QSA]
+
+    # Shared file pages with document title previews
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^s/([a-z0-9]{5})$ file.php?id=$1 [L,QSA]
+
+    # Protect the data folder
+    RewriteRule ^data/ - [F,L]
+
+    # Never serve development and backup artifacts.
+    RewriteRule ^tests/ - [F,L]
+    RewriteRule ^backups/ - [F,L]
+    RewriteRule ^backup\.sh$ - [F,L]
+</IfModule>
+
+# Protect hidden files (starting with a dot)
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+# Block known sensitive filenames if webroot is mis-synced
+<FilesMatch "(?i)^(\.env|config\.php|composer\.(json|lock)|package(-lock)?\.json)$">
+    Require all denied
+</FilesMatch>
+
+ErrorDocument 403 /403.html
+ErrorDocument 404 /404.html
