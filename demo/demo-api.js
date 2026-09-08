@@ -45,7 +45,8 @@
                     modified: false,
                     replacementDate: null,
                     category: 'Reference guides',
-                    previewUrl: 'iPhone-User-Guide.pdf'
+                    previewUrl: 'iPhone-User-Guide.pdf',
+                    compression: 'none'
                 },
                 {
                     id: 'focus',
@@ -57,7 +58,8 @@
                     modified: false,
                     replacementDate: null,
                     category: 'Team updates',
-                    previewUrl: 'The-Productivity-Project-Summary.pdf'
+                    previewUrl: 'The-Productivity-Project-Summary.pdf',
+                    compression: 'none'
                 }
             ],
             folderShares: { 'Product documents': 'Drive' }
@@ -149,11 +151,55 @@
         return parts.length > 1 ? parts.pop().toLowerCase() : '';
     }
 
+    const compressionJobs = {};
+
+    function shouldDemoCompress(record) {
+        return record.extension === 'pdf' && record.size > 30 * 1024 && record.size <= 40 * 1024 * 1024;
+    }
+
+    function scheduleDemoCompression(record) {
+        if (!shouldDemoCompress(record)) {
+            record.compression = 'none';
+            return 'none';
+        }
+        record.compression = 'pending';
+        compressionJobs[record.id] = {
+            doneAt: Date.now() + Math.min(4500, Math.max(1800, record.size / 900)),
+            newSize: Math.max(1024, Math.round(record.size * 0.72))
+        };
+        return 'pending';
+    }
+
+    function settleCompression(state, record) {
+        if (!record || record.compression !== 'pending') return record;
+        let job = compressionJobs[record.id];
+        if (!job) {
+            job = compressionJobs[record.id] = {
+                doneAt: Date.now() + 1200,
+                newSize: Math.max(1024, Math.round(record.size * 0.72))
+            };
+        }
+        if (Date.now() < job.doneAt) return record;
+        record.size = job.newSize;
+        record.compression = 'done';
+        delete compressionJobs[record.id];
+        writeState(state);
+        return record;
+    }
+
     function handle(action, input) {
         const state = readState();
 
         if (action === 'list' || action === 'categories') {
+            state.files.forEach((file) => settleCompression(state, file));
             return responseFor(state);
+        }
+
+        if (action === 'file_status') {
+            const record = state.files.find(item => item.id === input.id);
+            if (!record) return error('File not found');
+            settleCompression(state, record);
+            return { success: true, file: clientFile(record) };
         }
 
         if (action === 'upload') {
@@ -169,11 +215,13 @@
                 uploadDate: new Date().toISOString(),
                 modified: false,
                 replacementDate: null,
-                category: categoryExists(state, input.category) ? input.category : ROOT_CATEGORY
+                category: categoryExists(state, input.category) ? input.category : ROOT_CATEGORY,
+                compression: 'none'
             };
+            const compression = scheduleDemoCompression(record);
             state.files.push(record);
             writeState(state);
-            return { success: true, file: clientFile(record) };
+            return { success: true, file: clientFile(record), compression };
         }
 
         if (action === 'replace') {
@@ -188,8 +236,9 @@
             record.modified = true;
             record.replacementDate = new Date().toISOString();
             delete record.previewUrl;
+            const compression = scheduleDemoCompression(record);
             writeState(state);
-            return { success: true, file: clientFile(record) };
+            return { success: true, file: clientFile(record), compression };
         }
 
         if (action === 'rename') {
@@ -333,8 +382,89 @@
             input = JSON.parse(body);
         }
         action = action || input.action;
+        if (!action && parsedUrl.searchParams.has('id')) {
+            input.id = parsedUrl.searchParams.get('id');
+        }
+        if (!input.id && parsedUrl.searchParams.get('id')) {
+            input.id = parsedUrl.searchParams.get('id');
+        }
         return { action, input };
     }
+
+    function isDemoApiUrl(url) {
+        if (!url) return false;
+        const resolved = new URL(String(url), window.location.href);
+        return /(?:^|\/)api\.php$/.test(resolved.pathname);
+    }
+
+    function uploadDuration(file) {
+        const size = file && typeof file.size === 'number' ? file.size : 0;
+        return Math.min(5500, Math.max(1400, size / 18000));
+    }
+
+    function emitUploadProgress(xhr, file) {
+        return new Promise((resolve) => {
+            const duration = uploadDuration(file);
+            const start = Date.now();
+            const total = Math.max(1, Number(file.size) || 1);
+            const tick = () => {
+                const t = Math.min(1, (Date.now() - start) / duration);
+                const eased = 1 - Math.pow(1 - t, 2);
+                if (xhr.upload && typeof xhr.upload.onprogress === 'function') {
+                    xhr.upload.onprogress({
+                        lengthComputable: true,
+                        loaded: Math.round(eased * total),
+                        total
+                    });
+                }
+                if (t < 1) {
+                    requestAnimationFrame(tick);
+                } else {
+                    resolve();
+                }
+            };
+            tick();
+        });
+    }
+
+    function finishFakeXhr(xhr, payload) {
+        const body = JSON.stringify(clone(payload));
+        Object.defineProperty(xhr, 'status', { configurable: true, get: () => (payload.success ? 200 : 400) });
+        Object.defineProperty(xhr, 'readyState', { configurable: true, get: () => 4 });
+        Object.defineProperty(xhr, 'responseText', { configurable: true, get: () => body });
+        Object.defineProperty(xhr, 'response', { configurable: true, get: () => body });
+        if (typeof xhr.onload === 'function') {
+            xhr.onload();
+        }
+        if (typeof xhr.onreadystatechange === 'function') {
+            xhr.onreadystatechange();
+        }
+    }
+
+    const NativeXHR = window.XMLHttpRequest;
+    const nativeOpen = NativeXHR.prototype.open;
+    const nativeSend = NativeXHR.prototype.send;
+
+    NativeXHR.prototype.open = function (method, url, ...rest) {
+        this.__demoMethod = method;
+        this.__demoUrl = url;
+        return nativeOpen.call(this, method, url, ...rest);
+    };
+
+    NativeXHR.prototype.send = function (body) {
+        if (!isDemoApiUrl(this.__demoUrl)) {
+            return nativeSend.call(this, body);
+        }
+        const xhr = this;
+        parseRequest(this.__demoUrl, { body }).then(async ({ action, input }) => {
+            if ((action === 'upload' || action === 'replace') && input.file) {
+                await emitUploadProgress(xhr, input.file);
+            }
+            finishFakeXhr(xhr, handle(action, input));
+        }).catch(() => {
+            finishFakeXhr(xhr, error('Invalid request'));
+        });
+    };
 
     window.fetch = async (url, options = {}) => {
         const { action, input } = await parseRequest(url, options);

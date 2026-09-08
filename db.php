@@ -1,7 +1,7 @@
 <?php
 
 define('DB_FILE', __DIR__ . '/data/database.sqlite');
-define('DB_SCHEMA_VERSION', 3);
+define('DB_SCHEMA_VERSION', 4);
 
 function getDB() {
     static $pdo = null;
@@ -57,6 +57,10 @@ function ensure_database_schema(PDO $pdo) {
         if ($version < 3) {
             migrate_to_v3($pdo);
             $version = 3;
+        }
+        if ($version < 4) {
+            migrate_to_v4($pdo);
+            $version = 4;
         }
 
         $upsert = $pdo->prepare("
@@ -128,6 +132,10 @@ function migrate_to_v3(PDO $pdo) {
     )");
     $pdo->exec("CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at DESC)");
     $pdo->exec("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)");
+}
+
+function migrate_to_v4(PDO $pdo) {
+    ensure_column($pdo, 'files', 'compression', "ALTER TABLE files ADD COLUMN compression TEXT NOT NULL DEFAULT 'none'");
 }
 
 function ensure_column(PDO $pdo, $table, $column, $alterSql) {
