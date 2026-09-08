@@ -1501,14 +1501,6 @@ function deleteFile(file) {
     `;
     attachUndoTimerBar(fileElement);
 
-    const toastId = 'del-' + file.id;
-    showToast('', 'loading', {
-        id: toastId,
-        title: file.name,
-        description: 'Deleting…',
-        persistent: true
-    });
-
     const undoBtn = fileActions.querySelector('.undo-btn');
     let undoTimeout = null;
     let cancelled = false;
@@ -1540,7 +1532,6 @@ function deleteFile(file) {
         cancelled = true;
         clearTimeout(undoTimeout);
         restoreFileRow();
-        dismissToast(toastId);
     };
 
     undoBtn.addEventListener('click', undoHandler);
@@ -1560,14 +1551,17 @@ function deleteFile(file) {
                 files = files.filter(f => f.id !== file.id);
                 renderFiles();
                 updateStats();
-                finishFileToast(toastId, { type: 'success', description: 'Deleted' });
+                showToast('', 'success', {
+                    title: file.name,
+                    description: 'Deleted'
+                });
             } else {
-                finishFileToast(toastId, { type: 'error', description: data.error || 'Could not delete file' });
+                showToast(data.error || 'Could not delete file', 'error');
                 restoreFileRow();
             }
         } catch (error) {
             console.error('Error deleting file:', error);
-            finishFileToast(toastId, { type: 'error', description: 'Could not delete file' });
+            showToast('Could not delete file', 'error');
             restoreFileRow();
         }
     }, UNDO_DELAY_MS);
