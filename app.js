@@ -13,6 +13,12 @@ const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 3;
 /** Delay before delete is committed; matches undo-timer-bar animation. */
 const UNDO_DELAY_MS = 4000;
+const TOAST_EXIT_MS = 220;
+const TOAST_SUCCESS_MS = 2400;
+const TOAST_ERROR_MS = 4000;
+const TOAST_INFO_MS = 3000;
+const COMPRESSION_POLL_MS = 1000;
+const COMPRESSION_TIMEOUT_MS = 120000;
 const ALLOWED_UPLOAD_EXTENSIONS = new Set([
     'pdf', 'doc', 'docx', 'odp', 'pptm', 'jpg', 'jpeg', 'png', 'zip', 'mp4', 'mov'
 ]);
@@ -75,6 +81,7 @@ async function init() {
     updateStats();
     updateSortTabs();
     setupEventListeners();
+    resumeCompressionToasts();
 }
 
 function setupEventListeners() {
@@ -1092,7 +1099,27 @@ function handleFileSelect(e) {
 }
 
 async function uploadFiles(filesToUpload) {
-    const queue = Array.from(filesToUpload);
+    const queue = [];
+    for (const file of Array.from(filesToUpload)) {
+        if (file.size > MAX_UPLOAD_BYTES) {
+            showToast(`File too large: ${file.name}`, 'error');
+            continue;
+        }
+        const ext = clientFileExtension(file.name);
+        if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext)) {
+            showToast(`File type not allowed: ${file.name}`, 'error');
+            continue;
+        }
+        const toastId = nextToastId('up');
+        showToast('', 'loading', {
+            id: toastId,
+            title: file.name,
+            description: 'Uploading…',
+            persistent: true,
+            progress: 0
+        });
+        queue.push({ file, toastId });
+    }
     if (queue.length === 0) return;
 
     const workerCount = Math.min(UPLOAD_CONCURRENCY, queue.length);
@@ -1102,7 +1129,7 @@ async function uploadFiles(filesToUpload) {
             while (queue.length > 0) {
                 const next = queue.shift();
                 if (next) {
-                    await uploadFile(next);
+                    await uploadFile(next.file, next.toastId);
                 }
             }
         })());
@@ -1116,44 +1143,139 @@ function clientFileExtension(fileName) {
     return parts.pop().toLowerCase();
 }
 
-async function uploadFile(file) {
-    if (file.size > MAX_UPLOAD_BYTES) {
-        showToast(`File too large: ${file.name}`, 'error');
-        return;
-    }
-    const ext = clientFileExtension(file.name);
-    if (!ALLOWED_UPLOAD_EXTENSIONS.has(ext)) {
-        showToast(`File type not allowed: ${file.name}`, 'error');
-        return;
-    }
+function postFormWithProgress(formData, csrfAction, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', 'api.php');
+        xhr.setRequestHeader('X-CSRF-Token', csrfToken(csrfAction));
+        xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable && typeof onProgress === 'function') {
+                onProgress(event.loaded / event.total);
+            }
+        };
+        xhr.onload = () => {
+            let data;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch (error) {
+                reject(new Error('Invalid server response'));
+                return;
+            }
+            resolve(data);
+        };
+        xhr.onerror = () => reject(new Error('Network error'));
+        xhr.onabort = () => reject(new Error('Upload cancelled'));
+        xhr.send(formData);
+    });
+}
 
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForCompression(fileId) {
+    const deadline = Date.now() + COMPRESSION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        await sleep(COMPRESSION_POLL_MS);
+        try {
+            const response = await fetch('api.php?action=file_status&id=' + encodeURIComponent(fileId));
+            const data = await response.json();
+            if (data.success && data.file && data.file.compression !== 'pending') {
+                return data;
+            }
+        } catch (error) {
+            console.error('Error checking compression status:', error);
+        }
+    }
+    return null;
+}
+
+function applyFileUpdate(fileData) {
+    if (!fileData || !fileData.id) return;
+    const idx = files.findIndex((item) => item.id === fileData.id);
+    if (idx === -1) return;
+    files[idx] = { ...files[idx], ...fileData };
+    renderFiles();
+    updateStats();
+}
+
+async function maybeWaitForCompression(data, toastId) {
+    const file = data && data.file;
+    const compression = (data && data.compression) || (file && file.compression);
+    if (compression !== 'pending' || !file || !file.id) return;
+
+    updateToast(toastId, {
+        description: 'Compressing…',
+        type: 'loading',
+        persistent: true,
+        progress: 'indeterminate'
+    });
+
+    const result = await waitForCompression(file.id);
+    if (result && result.file) {
+        applyFileUpdate(result.file);
+    }
+}
+
+function resumeCompressionToasts() {
+    files.forEach((file) => {
+        if (!file || file.compression !== 'pending') return;
+        const toastId = 'cmp-' + file.id;
+        showToast('', 'loading', {
+            id: toastId,
+            title: file.name,
+            description: 'Compressing…',
+            persistent: true,
+            progress: 'indeterminate'
+        });
+        waitForCompression(file.id).then((result) => {
+            if (result && result.file) {
+                applyFileUpdate(result.file);
+            }
+            finishFileToast(toastId, { type: 'success', description: 'Uploaded' });
+        });
+    });
+}
+
+async function uploadFile(file, toastId) {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('action', 'upload');
     formData.append('category', currentCategory);
     addCsrfToken(formData, 'upload');
 
-    showToast(`Uploading: ${file.name}…`, 'info');
+    updateToast(toastId, {
+        description: 'Uploading…',
+        type: 'loading',
+        persistent: true,
+        progress: 0
+    });
 
     try {
-        const response = await fetch('api.php', {
-            method: 'POST',
-            headers: { 'X-CSRF-Token': csrfToken('upload') },
-            body: formData
+        const data = await postFormWithProgress(formData, 'upload', (ratio) => {
+            const pct = Math.round(ratio * 100);
+            updateToast(toastId, {
+                description: pct >= 100 ? 'Uploading…' : 'Uploading ' + pct + '%',
+                progress: ratio,
+                type: 'loading',
+                persistent: true
+            });
         });
-        const data = await response.json();
 
-        if (data.success) {
-            files.push(data.file);
-            renderFiles();
-            updateStats();
-            showToast(`File uploaded: ${file.name}`, 'success');
-        } else {
-            showToast(data.error || 'Error uploading file', 'error');
+        if (!data.success) {
+            finishFileToast(toastId, { type: 'error', description: data.error || 'Upload failed' });
+            return;
         }
+
+        files.push(data.file);
+        renderFiles();
+        updateStats();
+
+        await maybeWaitForCompression(data, toastId);
+        finishFileToast(toastId, { type: 'success', description: 'Uploaded' });
     } catch (error) {
         console.error('Error uploading file:', error);
-        showToast('Error uploading file', 'error');
+        finishFileToast(toastId, { type: 'error', description: 'Upload failed' });
     }
 }
 
@@ -1303,29 +1425,40 @@ function replaceFile(file) {
         formData.append('id', file.id);
         addCsrfToken(formData, 'replace');
 
-        showToast('Replacing file…', 'info');
+        const toastId = 'rp-' + file.id;
+        showToast('', 'loading', {
+            id: toastId,
+            title: newFile.name,
+            description: 'Uploading…',
+            persistent: true,
+            progress: 0
+        });
 
         try {
-            const response = await fetch('api.php', {
-                method: 'POST',
-                headers: { 'X-CSRF-Token': csrfToken('replace') },
-                body: formData
+            const data = await postFormWithProgress(formData, 'replace', (ratio) => {
+                const pct = Math.round(ratio * 100);
+                updateToast(toastId, {
+                    description: pct >= 100 ? 'Uploading…' : 'Uploading ' + pct + '%',
+                    progress: ratio,
+                    type: 'loading',
+                    persistent: true
+                });
             });
-            const data = await response.json();
 
             if (data.success) {
                 const fileIndex = files.findIndex(f => f.id === file.id);
                 if (fileIndex !== -1) {
                     files[fileIndex] = data.file;
                     renderFiles();
-                    showToast('File replaced', 'success');
                 }
+                await maybeWaitForCompression(data, toastId);
+                finishFileToast(toastId, { type: 'success', description: 'Uploaded' });
             } else {
-                showToast(data.error || 'Error replacing file', 'error');
+                finishFileToast(toastId, { type: 'error', description: data.error || 'Could not replace file' });
             }
         } catch (error) {
             console.error('Error replacing file:', error);
-            showToast('Error replacing file', 'error');
+            finishFileToast(toastId, { type: 'error', description: 'Could not replace file' });
         }
 
         document.body.removeChild(input);
@@ -1418,14 +1551,17 @@ function deleteFile(file) {
                 files = files.filter(f => f.id !== file.id);
                 renderFiles();
                 updateStats();
-                showToast('File deleted', 'success');
+                showToast('', 'success', {
+                    title: file.name,
+                    description: 'Deleted'
+                });
             } else {
-                showToast(data.error || 'Error deleting file', 'error');
+                showToast(data.error || 'Could not delete file', 'error');
                 restoreFileRow();
             }
         } catch (error) {
             console.error('Error deleting file:', error);
-            showToast('Error deleting file', 'error');
+            showToast('Could not delete file', 'error');
             restoreFileRow();
         }
     }, UNDO_DELAY_MS);
@@ -1505,26 +1641,161 @@ function updateStats() {
     todayCount.textContent = todayFiles.length;
 }
 
-function showToast(message, type = 'info') {
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
+function showToast(message, type = 'info', options = {}) {
+    const id = options.id || nextToastId('msg');
+    const persistent = options.persistent === true;
+    const title = options.title !== undefined ? options.title : message;
+    const description = options.description !== undefined ? options.description : (options.title ? message : '');
+    ensureToastElement(id, {
+        title,
+        description,
+        type,
+        progress: options.progress
+    });
+    clearToastTimer(id);
+    if (!persistent) {
+        const duration = options.duration
+            || (type === 'error' ? TOAST_ERROR_MS : type === 'success' ? TOAST_SUCCESS_MS : TOAST_INFO_MS);
+        toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
+    }
+    return id;
+}
+
+function nextToastId(prefix) {
+    toastSeq += 1;
+    return prefix + '-' + toastSeq;
+}
+
+let toastSeq = 0;
+const toastTimers = new Map();
+
+function prefersReducedMotion() {
+    return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function toastIconSvg(type) {
+    if (type === 'loading') {
+        return '<svg class="toast-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="42 18"/></svg>';
+    }
+    if (type === 'success') {
+        return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10.5l3.4 3.4L15 6.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    }
+    if (type === 'error') {
+        return '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6l8 8M14 6l-8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+    }
+    return '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 9.2v4.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="10" cy="6.6" r="0.9" fill="currentColor"/></svg>';
+}
+
+function currentToastProgress(toast) {
+    const wrap = toast.querySelector('.toast-progress');
+    if (!wrap || wrap.hidden) return null;
+    if (wrap.hasAttribute('data-indeterminate')) return 'indeterminate';
+    const width = toast.querySelector('.toast-progress-bar').style.width || '0%';
+    return Math.max(0, Math.min(1, parseFloat(width) / 100));
+}
+
+function renderToast(toast, options) {
+    const type = options.type || 'info';
+    toast.dataset.type = type;
     toast.setAttribute('role', 'status');
     toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
+    toast.querySelector('.toast-icon').innerHTML = toastIconSvg(type);
 
-    const msg = document.createElement('span');
-    msg.className = 'toast-message';
-    msg.textContent = message;
+    const titleEl = toast.querySelector('.toast-title');
+    const descEl = toast.querySelector('.toast-description');
+    titleEl.textContent = options.title || '';
+    titleEl.hidden = !options.title;
+    descEl.textContent = options.description || '';
+    descEl.hidden = !options.description;
 
-    toast.appendChild(msg);
-    toastContainer.appendChild(toast);
+    const progressWrap = toast.querySelector('.toast-progress');
+    const progressBar = toast.querySelector('.toast-progress-bar');
+    if (typeof options.progress === 'number') {
+        progressWrap.hidden = false;
+        progressWrap.removeAttribute('data-indeterminate');
+        progressBar.style.width = Math.round(Math.max(0, Math.min(1, options.progress)) * 100) + '%';
+    } else if (options.progress === 'indeterminate') {
+        progressWrap.hidden = false;
+        progressWrap.setAttribute('data-indeterminate', 'true');
+        progressBar.style.width = '';
+    } else {
+        progressWrap.hidden = true;
+        progressWrap.removeAttribute('data-indeterminate');
+        progressBar.style.width = '0%';
+    }
+}
 
-    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    setTimeout(() => {
-        if (!reduceMotion) {
-            toast.style.animation = 'slideIn 0.3s ease reverse';
-        }
-        setTimeout(() => toast.remove(), reduceMotion ? 0 : 300);
-    }, 3000);
+function ensureToastElement(id, options) {
+    let toast = toastContainer.querySelector('[data-toast-id="' + id + '"]');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.dataset.toastId = id;
+        toast.innerHTML =
+            '<div class="toast-icon"></div>' +
+            '<div class="toast-body">' +
+                '<div class="toast-title"></div>' +
+                '<div class="toast-description"></div>' +
+            '</div>' +
+            '<div class="toast-progress" hidden><div class="toast-progress-bar"></div></div>';
+        toastContainer.appendChild(toast);
+        requestAnimationFrame(() => {
+            toast.dataset.mounted = 'true';
+        });
+    }
+    renderToast(toast, options);
+    return toast;
+}
+
+function clearToastTimer(id) {
+    const timer = toastTimers.get(id);
+    if (timer) {
+        clearTimeout(timer);
+        toastTimers.delete(id);
+    }
+}
+
+function updateToast(id, patch) {
+    const toast = toastContainer.querySelector('[data-toast-id="' + id + '"]');
+    if (!toast) {
+        return showToast(patch.description || patch.title || '', patch.type || 'info', { id, ...patch });
+    }
+    const titleEl = toast.querySelector('.toast-title');
+    const descEl = toast.querySelector('.toast-description');
+    renderToast(toast, {
+        title: patch.title !== undefined ? patch.title : titleEl.textContent,
+        description: patch.description !== undefined ? patch.description : descEl.textContent,
+        type: patch.type || toast.dataset.type,
+        progress: patch.progress !== undefined ? patch.progress : currentToastProgress(toast)
+    });
+    if (patch.persistent === false) {
+        const type = patch.type || toast.dataset.type;
+        const duration = patch.duration || (type === 'error' ? TOAST_ERROR_MS : TOAST_SUCCESS_MS);
+        clearToastTimer(id);
+        toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
+    } else if (patch.persistent === true) {
+        clearToastTimer(id);
+    }
+}
+
+function dismissToast(id) {
+    const toast = toastContainer.querySelector('[data-toast-id="' + id + '"]');
+    clearToastTimer(id);
+    if (!toast || toast.dataset.removed === 'true') return;
+    toast.dataset.removed = 'true';
+    toast.dataset.mounted = 'false';
+    const delay = prefersReducedMotion() ? 0 : TOAST_EXIT_MS;
+    setTimeout(() => toast.remove(), delay);
+}
+
+function finishFileToast(id, options) {
+    updateToast(id, {
+        type: options.type || 'success',
+        description: options.description,
+        title: options.title,
+        progress: null,
+        persistent: false
+    });
 }
 
 init();

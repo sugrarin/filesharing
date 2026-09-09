@@ -169,65 +169,107 @@ function resolve_upload_path($fileId, $extension) {
     return $filePath;
 }
 
-function schedule_pdf_compression($filePath, $fileId) {
-    if (strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) !== 'pdf') {
-        return;
+function file_payload_from_row(array $row) {
+    return [
+        'id' => $row['id'],
+        'name' => $row['name'],
+        'originalName' => $row['original_name'],
+        'extension' => $row['extension'],
+        'size' => (int)$row['size'],
+        'uploadDate' => $row['upload_date'],
+        'modified' => (bool)$row['modified'],
+        'replacementDate' => $row['replacement_date'] ?? null,
+        'category' => $row['category_name'] ?? 'All files',
+        'compression' => $row['compression'] ?? 'none',
+    ];
+}
+
+function pdf_gs_path() {
+    static $path = null;
+    if ($path !== null) {
+        return $path;
     }
-    // Defer heavy Ghostscript work until after the response is sent.
+    $path = '';
+    if (!function_exists('shell_exec') || !function_exists('exec')) {
+        return $path;
+    }
+    $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+    if (in_array('shell_exec', $disabled, true) || in_array('exec', $disabled, true)) {
+        return $path;
+    }
+    $found = @trim((string)shell_exec('which gs 2>/dev/null'));
+    if ($found === '') {
+        foreach (['/usr/bin/gs', '/usr/local/bin/gs', '/opt/homebrew/bin/gs'] as $candidate) {
+            if (file_exists($candidate)) {
+                $found = $candidate;
+                break;
+            }
+        }
+    }
+    $path = $found;
+    return $path;
+}
+
+function should_compress_pdf($filePath) {
+    if (strtolower(pathinfo($filePath, PATHINFO_EXTENSION)) !== 'pdf') {
+        return false;
+    }
+    $size = @filesize($filePath);
+    if ($size === false || $size <= 0 || $size > 40 * 1024 * 1024) {
+        return false;
+    }
+    return pdf_gs_path() !== '';
+}
+
+function set_file_compression($fileId, $status, $size = null) {
+    try {
+        $pdo = getDB();
+        if ($size === null) {
+            $stmt = $pdo->prepare('UPDATE files SET compression = ? WHERE id = ?');
+            $stmt->execute([$status, $fileId]);
+        } else {
+            $stmt = $pdo->prepare('UPDATE files SET compression = ?, size = ? WHERE id = ?');
+            $stmt->execute([$status, (int)$size, $fileId]);
+        }
+    } catch (Throwable $e) {
+        error_log('File Sharing compression status error: ' . $e->getMessage());
+    }
+}
+
+function schedule_pdf_compression($filePath, $fileId) {
+    if (!should_compress_pdf($filePath)) {
+        return false;
+    }
+    set_file_compression($fileId, 'pending');
     register_shutdown_function(function () use ($filePath, $fileId) {
         ignore_user_abort(true);
         if (function_exists('fastcgi_finish_request')) {
             @fastcgi_finish_request();
         }
         if (!is_file($filePath)) {
+            set_file_compression($fileId, 'skipped');
             return;
         }
         $compressed = compressPdf($filePath);
-        if (!$compressed) {
-            return;
-        }
         clearstatcache(true, $filePath);
         $newSize = @filesize($filePath);
-        if ($newSize === false) {
+        if ($compressed && $newSize !== false) {
+            set_file_compression($fileId, 'done', $newSize);
             return;
         }
-        try {
-            $pdo = getDB();
-            $stmt = $pdo->prepare('UPDATE files SET size = ? WHERE id = ?');
-            $stmt->execute([(int)$newSize, $fileId]);
-        } catch (Throwable $e) {
-            error_log('File Sharing PDF size update error: ' . $e->getMessage());
-        }
+        set_file_compression($fileId, 'skipped');
     });
+    return true;
 }
 
 function compressPdf($filePath) {
-    if (!function_exists('shell_exec') || !function_exists('exec')) {
+    $gsPath = pdf_gs_path();
+    if ($gsPath === '') {
         return false;
     }
 
-    $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
-    if (in_array('shell_exec', $disabled, true) || in_array('exec', $disabled, true)) {
-        return false;
-    }
-
-    // Skip very large PDFs to avoid long host process limits.
     $size = @filesize($filePath);
     if ($size !== false && $size > 40 * 1024 * 1024) {
-        return false;
-    }
-
-    $gsPath = @trim((string)shell_exec('which gs 2>/dev/null'));
-    if ($gsPath === '') {
-        foreach (['/usr/bin/gs', '/usr/local/bin/gs', '/opt/homebrew/bin/gs'] as $path) {
-            if (file_exists($path)) {
-                $gsPath = $path;
-                break;
-            }
-        }
-    }
-
-    if ($gsPath === '') {
         return false;
     }
 
@@ -327,17 +369,7 @@ function listFiles($pdo) {
     ");
     $files = [];
     while ($row = $stmt->fetch()) {
-        $files[] = [
-            'id' => $row['id'],
-            'name' => $row['name'],
-            'originalName' => $row['original_name'],
-            'extension' => $row['extension'],
-            'size' => (int)$row['size'],
-            'uploadDate' => $row['upload_date'],
-            'modified' => (bool)$row['modified'],
-            'replacementDate' => $row['replacement_date'],
-            'category' => $row['category_name'] ?? 'All files'
-        ];
+        $files[] = file_payload_from_row($row);
     }
     return $files;
 }
@@ -411,6 +443,7 @@ if (!is_string($action) || $action === '') {
 $allowedActions = [
     'list' => 'GET',
     'categories' => 'GET',
+    'file_status' => 'GET',
     'folder_share' => 'POST',
     'folder_unshare' => 'POST',
     'upload' => 'POST',
@@ -450,6 +483,24 @@ try {
                 'files' => listFiles($pdo),
                 'categories' => listCategories($pdo),
                 'sharedCategories' => getSharedCategoryNames($pdo)
+            ]);
+
+        case 'file_status':
+            $statusId = require_file_id_param($_GET['id'] ?? null);
+            $stmtStatus = $pdo->prepare("
+                SELECT f.*, c.name as category_name
+                FROM files f
+                LEFT JOIN categories c ON f.category_id = c.id
+                WHERE f.id = ?
+            ");
+            $stmtStatus->execute([$statusId]);
+            $statusRow = $stmtStatus->fetch();
+            if (!$statusRow) {
+                json_error('File not found', 404);
+            }
+            json_response([
+                'success' => true,
+                'file' => file_payload_from_row($statusRow)
             ]);
 
         case 'folder_share':
@@ -566,12 +617,14 @@ try {
             ];
 
             writeSharePage($fileData, UPLOAD_DIR);
-            schedule_pdf_compression($filePath, $fileId);
+            $compressing = schedule_pdf_compression($filePath, $fileId);
+            $fileData['compression'] = $compressing ? 'pending' : 'none';
             audit_log('upload', $fileId, $originalName);
 
             json_response([
                 'success' => true,
-                'file' => $fileData
+                'file' => $fileData,
+                'compression' => $fileData['compression']
             ]);
 
         case 'replace':
@@ -637,12 +690,14 @@ try {
             ];
 
             writeSharePage($responseData, UPLOAD_DIR);
-            schedule_pdf_compression($filePath, $fileId);
+            $compressing = schedule_pdf_compression($filePath, $fileId);
+            $responseData['compression'] = $compressing ? 'pending' : 'none';
             audit_log('replace', $fileId, $originalName);
 
             json_response([
                 'success' => true,
-                'file' => $responseData
+                'file' => $responseData,
+                'compression' => $responseData['compression']
             ]);
 
         case 'rename':
